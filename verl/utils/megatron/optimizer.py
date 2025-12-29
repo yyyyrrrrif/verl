@@ -13,15 +13,14 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-import torch
-from megatron.core.optimizer import OptimizerConfig
+from verl.utils.megatron_adapter import MegatronAdapter, TorchAdapter
 from megatron.core.optimizer import get_megatron_optimizer as get_megatron_optimizer_native
 from megatron.core.optimizer_param_scheduler import OptimizerParamScheduler
 
 from verl.utils.logger import print_rank_0
 
 
-def init_megatron_optim_config(optim_config: dict, fp16: bool = False) -> OptimizerConfig:
+def init_megatron_optim_config(optim_config: dict, fp16: bool = False):
     optim_args = {
         "optimizer": optim_config.optimizer,
         "lr": optim_config.lr,
@@ -35,7 +34,7 @@ def init_megatron_optim_config(optim_config: dict, fp16: bool = False) -> Optimi
             {
                 "bf16": False,
                 "fp16": True,
-                "params_dtype": torch.float16,
+                "params_dtype": TorchAdapter.float16(),
                 "initial_loss_scale": 32768,
                 "min_loss_scale": 1,
                 "use_precision_aware_optimizer": True,
@@ -46,7 +45,7 @@ def init_megatron_optim_config(optim_config: dict, fp16: bool = False) -> Optimi
         optim_args.update(
             {
                 "bf16": True,
-                "params_dtype": torch.bfloat16,
+                "params_dtype": TorchAdapter.bfloat16(),
             }
         )
     override_config = optim_config.get("override_optimizer_config", {})
@@ -56,13 +55,13 @@ def init_megatron_optim_config(optim_config: dict, fp16: bool = False) -> Optimi
 
     print_rank_0(f"optimizer config after override: {optim_args}")
 
-    config = OptimizerConfig(**optim_args)
+    config = MegatronAdapter.OptimizerConfig(**optim_args)
     return config
 
 
 def get_megatron_optimizer(
     model,
-    config: OptimizerConfig,
+    config,
     no_weight_decay_cond=None,
     scale_lr_cond=None,
     lr_mult=1.0,

@@ -23,16 +23,7 @@ import warnings
 from dataclasses import dataclass
 from typing import Any
 
-import torch
-import torch.nn.functional as F
-from megatron.core import ModelParallelConfig, mpu, parallel_state, tensor_parallel
-from megatron.core.distributed import DistributedDataParallel as DDP
-from megatron.core.distributed import DistributedDataParallelConfig
-from megatron.core.enums import ModelType
-from megatron.core.optimizer import ChainedOptimizer
-from megatron.core.transformer import TransformerConfig
-from megatron.core.transformer.module import Float16Module
-from megatron.core.utils import get_attr_wrapped_model
+from verl.utils.megatron_adapter import MegatronAdapter, TorchAdapter
 from transformers import PretrainedConfig
 
 import verl.utils.megatron.tensor_parallel as tp_utils
@@ -41,9 +32,79 @@ from verl.utils.fs import local_mkdir_safe
 from verl.utils.model import normalize_model_name
 from verl.utils.torch_dtypes import PrecisionType
 
+# Import megatron interfaces through adapter
+# Create a mock mpu object that uses MegatronAdapter methods
+class _MPUAdapter:
+    """Adapter for mpu (parallel_state) that uses MegatronAdapter"""
+    def get_pipeline_model_parallel_world_size(self):
+        return MegatronAdapter.get_pipeline_model_parallel_world_size()
+    
+    def get_virtual_pipeline_model_parallel_world_size(self):
+        return MegatronAdapter.get_virtual_pipeline_model_parallel_world_size()
+    
+    def set_virtual_pipeline_model_parallel_rank(self, rank):
+        return MegatronAdapter.set_virtual_pipeline_model_parallel_rank(rank)
+    
+    def is_pipeline_first_stage(self, **kwargs):
+        return MegatronAdapter.is_pipeline_first_stage(**kwargs)
+    
+    def is_pipeline_last_stage(self, **kwargs):
+        return MegatronAdapter.is_pipeline_last_stage(**kwargs)
+    
+    def get_pipeline_model_parallel_rank(self):
+        return MegatronAdapter.get_pipeline_model_parallel_rank()
+    
+    def get_pipeline_model_parallel_split_rank(self):
+        return MegatronAdapter.get_pipeline_model_parallel_split_rank()
+    
+    def is_pipeline_stage_before_split(self):
+        return MegatronAdapter.is_pipeline_stage_before_split()
+    
+    def is_pipeline_stage_after_split(self):
+        return MegatronAdapter.is_pipeline_stage_after_split()
+    
+    def get_data_parallel_rank(self):
+        return MegatronAdapter.get_data_parallel_rank()
+    
+    def get_tensor_model_parallel_rank(self):
+        return MegatronAdapter.get_tensor_model_parallel_rank()
+    
+    def get_pipeline_model_parallel_group(self):
+        return MegatronAdapter.get_pipeline_model_parallel_group()
+    
+    def get_tensor_model_parallel_group(self):
+        return MegatronAdapter.get_tensor_model_parallel_group()
+    
+    def get_expert_model_parallel_group(self):
+        return MegatronAdapter.get_expert_model_parallel_group()
+    
+    def get_expert_tensor_parallel_group(self):
+        return MegatronAdapter.get_expert_tensor_parallel_group()
+    
+    def get_context_parallel_world_size(self):
+        return MegatronAdapter.get_context_parallel_world_size()
+    
+    def get_tensor_model_parallel_world_size(self):
+        return MegatronAdapter.get_tensor_model_parallel_world_size()
+    
+    def get_expert_model_parallel_world_size(self):
+        return MegatronAdapter.get_expert_model_parallel_world_size()
+    
+    def get_expert_tensor_parallel_world_size(self):
+        return MegatronAdapter.get_expert_tensor_parallel_world_size()
+
+mpu = _MPUAdapter()
+DDP = MegatronAdapter.DistributedDataParallel
+DistributedDataParallelConfig = MegatronAdapter.DistributedDataParallelConfig
+ModelType = MegatronAdapter.ModelType()
+ChainedOptimizer = MegatronAdapter.ChainedOptimizer
+TransformerConfig = MegatronAdapter.TransformerConfig
+Float16Module = MegatronAdapter.Float16Module
+ModelParallelConfig = MegatronAdapter.ModelParallelConfig
+
 
 def get_model_config(model):
-    return get_attr_wrapped_model(model, "config", allow_none=False)
+    return MegatronAdapter.get_attr_wrapped_model(model, "config", allow_none=False)
 
 
 def get_model(
@@ -109,7 +170,7 @@ def get_model(
     # are set for all params so the optimizer can use them.
     for model_module in model:
         for param in model_module.parameters():
-            tensor_parallel.set_defaults_if_not_set_tensor_model_parallel_attributes(param)
+            MegatronAdapter.set_defaults_if_not_set_tensor_model_parallel_attributes(param)
 
     # Print number of parameters.
     if mpu.get_data_parallel_rank() == 0:
@@ -268,29 +329,29 @@ def convert_config(hf_config: PretrainedConfig, megatron_config) -> TransformerC
         num_query_groups=hf_config.num_key_value_heads,
         ffn_hidden_size=hf_config.intermediate_size,
         #    max_position_embeddings=hf_config.max_position_embeddings,
-        activation_func=F.silu,
+        activation_func=TorchAdapter.F_silu,
         normalization="RMSNorm",
         #    rotary_percent=False, # default,
         gated_linear_unit=True,  # for llama
         use_cpu_initialization=True,
         apply_residual_connection_post_layernorm=False,  # check what's this mean
         add_bias_linear=False,
-        tensor_model_parallel_size=mpu.get_tensor_model_parallel_world_size(),
+        tensor_model_parallel_size=MegatronAdapter.get_tensor_model_parallel_world_size(),
         pipeline_model_parallel_size=mpu.get_pipeline_model_parallel_world_size(),
         virtual_pipeline_model_parallel_size=mpu.get_virtual_pipeline_model_parallel_world_size(),
-        context_parallel_size=mpu.get_context_parallel_world_size(),
+        context_parallel_size=MegatronAdapter.get_context_parallel_world_size(),
         overlap_p2p_comm=overlap_p2p_comm,
         batch_p2p_comm=batch_p2p_comm,
         pipeline_dtype=dt,
         params_dtype=dt,
-        sequence_parallel=mpu.get_tensor_model_parallel_world_size() > 1,
+        sequence_parallel=MegatronAdapter.get_tensor_model_parallel_world_size() > 1,
         variable_seq_lengths=True,
         masked_softmax_fusion=True,
         moe_token_dispatcher_type="alltoall",
         attention_dropout=hf_config.attention_dropout,
         hidden_dropout=getattr(hf_config, "hidden_dropout", 0.0),
         add_qkv_bias=qkv_bias,
-        bf16=dt is torch.bfloat16,
+        bf16=dt is TorchAdapter.bfloat16(),
     )
 
     return transformer_config
@@ -298,7 +359,7 @@ def convert_config(hf_config: PretrainedConfig, megatron_config) -> TransformerC
 
 def mcore_model_parallel_config(
     sequence_parallel: bool,
-    params_dtype: torch.dtype,
+    params_dtype,
 ) -> ModelParallelConfig:
     # WARNING: Code should not reach this point. This function is deprecated and will be removed.
     # Please use hf_to_mcore_config_dense() from verl.models.mcore.config_converter instead.
@@ -309,10 +370,10 @@ def mcore_model_parallel_config(
         stacklevel=2,
     )
     return ModelParallelConfig(
-        tensor_model_parallel_size=mpu.get_tensor_model_parallel_world_size(),
+        tensor_model_parallel_size=MegatronAdapter.get_tensor_model_parallel_world_size(),
         pipeline_model_parallel_size=mpu.get_pipeline_model_parallel_world_size(),
         virtual_pipeline_model_parallel_size=mpu.get_virtual_pipeline_model_parallel_world_size(),
-        context_parallel_size=mpu.get_context_parallel_world_size(),
+        context_parallel_size=MegatronAdapter.get_context_parallel_world_size(),
         sequence_parallel=sequence_parallel,
         params_dtype=params_dtype,
         pipeline_dtype=params_dtype,
@@ -322,7 +383,7 @@ def mcore_model_parallel_config(
     )
 
 
-@torch.no_grad()
+@TorchAdapter.no_grad()
 def offload_megatron_model_to_cpu(models):
     """
     In megatron, the model and optimizer storage are:
@@ -355,10 +416,10 @@ def offload_megatron_model_to_cpu(models):
                 if param.grad is not None:
                     param.grad = param.grad.to("cpu", non_blocking=True)
     gc.collect()
-    get_torch_device().empty_cache()
+    TorchAdapter.empty_cache()
 
 
-@torch.no_grad()
+@TorchAdapter.no_grad()
 def load_megatron_model_to_gpu(models, load_grad=True):
     for model_chunk in models:
         if isinstance(model_chunk, DDP):
@@ -382,10 +443,10 @@ def load_megatron_model_to_gpu(models, load_grad=True):
                 if param.grad is not None:
                     param.grad = param.grad.to(device_id, non_blocking=True)
     gc.collect()
-    get_torch_device().empty_cache()
+    TorchAdapter.empty_cache()
 
 
-@torch.no_grad()
+@TorchAdapter.no_grad()
 def offload_megatron_copy_params(optimizers):
     """
     Offload optimizer parameters to CPU. Supports both Megatron optimizers
@@ -426,7 +487,7 @@ def offload_megatron_copy_params(optimizers):
             offload_group_to_cpu(_opt.shard_fp32_from_float16_groups)
 
 
-@torch.no_grad()
+@TorchAdapter.no_grad()
 def load_megatron_copy_params(optimizers):
     """
     Load optimizer parameters back to GPU. Handles ChainedOptimizer.
@@ -467,7 +528,7 @@ def load_megatron_copy_params(optimizers):
             load_group_to_gpu(_opt.shard_fp32_from_float16_groups)
 
 
-@torch.no_grad()
+@TorchAdapter.no_grad()
 def offload_megatron_optimizer(optimizers):
     def _iter_opts(opt):
         if isinstance(opt, ChainedOptimizer):
@@ -485,10 +546,10 @@ def offload_megatron_optimizer(optimizers):
                 if "exp_avg_sq" in v:
                     v["exp_avg_sq"] = v["exp_avg_sq"].to("cpu", non_blocking=True)
         gc.collect()
-        get_torch_device().empty_cache()
+        TorchAdapter.empty_cache()
 
 
-@torch.no_grad()
+@TorchAdapter.no_grad()
 def load_megatron_optimizer(optimizers):
     def _iter_opts(opt):
         if isinstance(opt, ChainedOptimizer):
@@ -510,7 +571,7 @@ def load_megatron_optimizer(optimizers):
                     if "exp_avg_sq" in v:
                         v["exp_avg_sq"] = v["exp_avg_sq"].to(get_device_id(), non_blocking=True)
         gc.collect()
-        get_torch_device().empty_cache()
+        TorchAdapter.empty_cache()
 
 
 def get_dist_checkpoint_path(checkpoint_path):
@@ -585,9 +646,9 @@ def convert_megatron_model_to_transformers_model(
                         k_shard_list.append(k_part)
                         v_shard_list.append(v_part)
 
-        new_params[q_name] = torch.cat(q_shard_list, dim=0)
-        new_params[k_name] = torch.cat(k_shard_list, dim=0)
-        new_params[v_name] = torch.cat(v_shard_list, dim=0)
+        new_params[q_name] = TorchAdapter.cat(q_shard_list, dim=0)
+        new_params[k_name] = TorchAdapter.cat(k_shard_list, dim=0)
+        new_params[v_name] = TorchAdapter.cat(v_shard_list, dim=0)
 
     def convert_gate_up_shard(full_tensor, gate_name, up_name):
         nonlocal config
@@ -603,8 +664,8 @@ def convert_megatron_model_to_transformers_model(
             gate_weight_list.append(gate_weight_tp)
             up_weight_list.append(up_weight_tp)
 
-        new_params[gate_name] = torch.cat(gate_weight_list, dim=0)
-        new_params[up_name] = torch.cat(up_weight_list, dim=0)
+        new_params[gate_name] = TorchAdapter.cat(gate_weight_list, dim=0)
+        new_params[up_name] = TorchAdapter.cat(up_weight_list, dim=0)
 
     if name == "embedding.word_embeddings.weight":
         new_params["model.embed_tokens.weight"] = param
@@ -670,7 +731,7 @@ def convert_megatron_model_to_transformers_model(
     return new_params.keys(), new_params.values()
 
 
-def broadcast_from_megatron_pp(tensor: torch.Tensor):
+def broadcast_from_megatron_pp(tensor):
     # tensor is not None only in one of the pp ranks
     if tensor is not None:
         shape = tensor.shape
@@ -681,7 +742,7 @@ def broadcast_from_megatron_pp(tensor: torch.Tensor):
     else:
         tensor_spec = None
     tensor_spec_output = [None] * mpu.get_pipeline_model_parallel_world_size()
-    torch.distributed.all_gather_object(
+    TorchAdapter.distributed_all_gather_object(
         object_list=tensor_spec_output, obj=tensor_spec, group=mpu.get_pipeline_model_parallel_group()
     )
     # find the src rank
@@ -696,20 +757,20 @@ def broadcast_from_megatron_pp(tensor: torch.Tensor):
             src_rank = rank
     assert target_tensor_spec is not None
     if tensor is None:
-        tensor = torch.empty(size=target_tensor_spec[0], dtype=target_tensor_spec[1], device=get_device_id())
+        tensor = TorchAdapter.empty(size=target_tensor_spec[0], dtype=target_tensor_spec[1], device=get_device_id())
         if target_tensor_spec[2] is not None:
             tensor.tensor_model_parallel = target_tensor_spec[2]
         if target_tensor_spec[3] is not None:
             tensor.partition_dim = target_tensor_spec[3]
 
-    global_rank = torch.distributed.get_global_rank(group=mpu.get_pipeline_model_parallel_group(), group_rank=src_rank)
-    torch.distributed.broadcast(tensor=tensor, src=global_rank, group=mpu.get_pipeline_model_parallel_group())
+    global_rank = TorchAdapter.distributed_get_global_rank(group=mpu.get_pipeline_model_parallel_group(), group_rank=src_rank)
+    TorchAdapter.distributed_broadcast(tensor=tensor, src=global_rank, group=mpu.get_pipeline_model_parallel_group())
     return tensor
 
 
 def broadcast_str_from_megatron_pp(obj: Any):
     obj_output = [None] * mpu.get_pipeline_model_parallel_world_size()
-    torch.distributed.all_gather_object(object_list=obj_output, obj=obj, group=mpu.get_pipeline_model_parallel_group())
+    TorchAdapter.distributed_all_gather_object(object_list=obj_output, obj=obj, group=mpu.get_pipeline_model_parallel_group())
 
     src_rank = None
     target_obj = None
@@ -722,11 +783,11 @@ def broadcast_str_from_megatron_pp(obj: Any):
 
     assert target_obj is not None, "No valid object found to broadcast."
 
-    global_rank = torch.distributed.get_global_rank(group=mpu.get_pipeline_model_parallel_group(), group_rank=src_rank)
+    global_rank = TorchAdapter.distributed_get_global_rank(group=mpu.get_pipeline_model_parallel_group(), group_rank=src_rank)
 
-    obj_output = [None] * torch.distributed.get_world_size(group=mpu.get_pipeline_model_parallel_group())
+    obj_output = [None] * TorchAdapter.distributed_get_world_size(group=mpu.get_pipeline_model_parallel_group())
     obj_output[0] = target_obj
-    torch.distributed.broadcast_object_list(
+    TorchAdapter.distributed_broadcast_object_list(
         object_list=obj_output, src=global_rank, group=mpu.get_pipeline_model_parallel_group()
     )
 
@@ -751,9 +812,7 @@ def default_tp_concat_fn(
     definition so that it is model-agnostic. If the model doesn't implement this function,
     we can throw an error to force user disable TP HybridEngine.
     """
-    from megatron.core import mpu
-
-    train_tp_size = mpu.get_tensor_model_parallel_world_size()
+    train_tp_size = MegatronAdapter.get_tensor_model_parallel_world_size()
     if layer_name_mapping.get("qkv_layer_name") in name and "layer_norm" not in name:
         # if the tensor is qkv, for each param on tp, split into q, k, v
         # concat q, k, v separately.
@@ -784,10 +843,10 @@ def default_tp_concat_fn(
                 q_lst.append(q)
                 k_lst.append(k)
                 v_lst.append(v)
-        q = torch.cat(q_lst, dim=0)
-        k = torch.cat(k_lst, dim=0)
-        v = torch.cat(v_lst, dim=0)
-        infer_params = torch.cat((q, k, v), dim=0) if not convert_qkv_gate_up_by_simple_split else [q, k, v]
+        q = TorchAdapter.cat(q_lst, dim=0)
+        k = TorchAdapter.cat(k_lst, dim=0)
+        v = TorchAdapter.cat(v_lst, dim=0)
+        infer_params = TorchAdapter.cat((q, k, v), dim=0) if not convert_qkv_gate_up_by_simple_split else [q, k, v]
 
     elif (
         layer_name_mapping.get("gate_proj_layer_name") in name
@@ -801,16 +860,16 @@ def default_tp_concat_fn(
             gate, up = infer_param.chunk(2)
             gate_lst.append(gate)
             up_lst.append(up)
-        gate = torch.cat(gate_lst, dim=0)
-        up = torch.cat(up_lst, dim=0)
-        infer_params = torch.cat((gate, up), dim=0) if not convert_qkv_gate_up_by_simple_split else [gate, up]
+        gate = TorchAdapter.cat(gate_lst, dim=0)
+        up = TorchAdapter.cat(up_lst, dim=0)
+        infer_params = TorchAdapter.cat((gate, up), dim=0) if not convert_qkv_gate_up_by_simple_split else [gate, up]
 
     elif "mlp.experts.linear_fc2.weight" in name:  # moe
-        infer_params = torch.cat(infer_params, dim=1)
+        infer_params = TorchAdapter.cat(infer_params, dim=1)
 
     else:
         # concat tensor
-        infer_params = torch.cat(infer_params, dim=tp_utils.get_tensor_parallel_partition_dim(train_params))
+        infer_params = TorchAdapter.cat(infer_params, dim=tp_utils.get_tensor_parallel_partition_dim(train_params))
 
     return infer_params
 
@@ -823,16 +882,14 @@ def per_tensor_generator(
     layer_name_mapping,
     convert_qkv_gate_up_by_simple_split=True,
 ):
-    from megatron.core import parallel_state as mpu
-
-    pp_rank = mpu.get_pipeline_model_parallel_rank()
-    ep_size = mpu.get_expert_model_parallel_world_size()
-    etp_size = mpu.get_expert_tensor_parallel_world_size()
-    ep_group = mpu.get_expert_model_parallel_group()
-    etp_group = mpu.get_expert_tensor_parallel_group()
+    pp_rank = MegatronAdapter.get_pipeline_model_parallel_rank()
+    ep_size = MegatronAdapter.get_expert_model_parallel_world_size()
+    etp_size = MegatronAdapter.get_expert_tensor_parallel_world_size()
+    ep_group = MegatronAdapter.get_expert_model_parallel_group()
+    etp_group = MegatronAdapter.get_expert_tensor_parallel_group()
     vpp_size = len(actor_module)
-    all_gather_group = mpu.get_tensor_model_parallel_group()
-    all_gather_group_size = torch.distributed.get_world_size(group=all_gather_group)
+    all_gather_group = MegatronAdapter.get_tensor_model_parallel_group()
+    all_gather_group_size = TorchAdapter.distributed_get_world_size(group=all_gather_group)
 
     def tensor_generator():
         for scan_vpp_idx in range(vpp_size):
@@ -862,7 +919,7 @@ def per_tensor_generator(
             meta_info.append((pp_rank, scan_vpp_idx, idx, name))
 
     obj_spec_output = [None] * mpu.get_pipeline_model_parallel_world_size()
-    torch.distributed.all_gather_object(
+    TorchAdapter.distributed_all_gather_object(
         object_list=obj_spec_output, obj=meta_info, group=mpu.get_pipeline_model_parallel_group()
     )
     layer_list_meta = [item for sublist in obj_spec_output for item in sublist]
@@ -900,8 +957,8 @@ def per_tensor_generator(
         if ".mlp.experts.linear_fc" in cur_name and ep_size > 1:
             num_experts = weight_converter.mcore_config.num_moe_experts
             num_experts_per_rank = num_experts // ep_size
-            infer_params = [torch.empty_like(broad_pp_tensor) for _ in range(ep_size)]
-            torch.distributed.all_gather(infer_params, broad_pp_tensor, group=ep_group)
+            infer_params = [TorchAdapter.empty_like(broad_pp_tensor) for _ in range(ep_size)]
+            TorchAdapter.distributed_all_gather(infer_params, broad_pp_tensor, group=ep_group)
 
             name_prefix, local_expert_id = cur_name.split(".weight")
             local_expert_id = int(local_expert_id)
@@ -911,8 +968,8 @@ def per_tensor_generator(
             for name, param in zip(global_expert_names, infer_params, strict=True):
                 if etp_size > 1:
                     # gather etp
-                    etp_params = [torch.empty_like(param) for _ in range(etp_size)]
-                    torch.distributed.all_gather(etp_params, param, group=etp_group)
+                    etp_params = [TorchAdapter.empty_like(param) for _ in range(etp_size)]
+                    TorchAdapter.distributed_all_gather(etp_params, param, group=etp_group)
                     params = etp_params
                 else:
                     params = [param]
@@ -939,8 +996,8 @@ def per_tensor_generator(
             if all_gather_group_size <= 1:
                 infer_params = [broad_pp_tensor]
             else:
-                infer_params = [torch.empty_like(broad_pp_tensor) for _ in range(all_gather_group_size)]
-                torch.distributed.all_gather(infer_params, broad_pp_tensor, group=mpu.get_tensor_model_parallel_group())
+                infer_params = [TorchAdapter.empty_like(broad_pp_tensor) for _ in range(all_gather_group_size)]
+                TorchAdapter.distributed_all_gather(infer_params, broad_pp_tensor, group=MegatronAdapter.get_tensor_model_parallel_group())
             infer_params = default_tp_concat_fn(
                 layer_name_mapping,
                 cur_name,
@@ -971,8 +1028,9 @@ def get_transformer_layer_offset(pipeline_rank, vp_stage, config: TransformerCon
     Extension to https://github.com/NVIDIA/Megatron-LM/blob/main/megatron/core/transformer/transformer_layer.py::get_transformer_layer_offset
     """
 
+    # Use MegatronAdapter to check if is_pipeline_first_stage has vp_stage parameter
     has_vp_stage = (
-        inspect.signature(parallel_state.is_pipeline_first_stage).parameters.get("vp_stage", None) is not None
+        inspect.signature(MegatronAdapter.is_pipeline_first_stage).parameters.get("vp_stage", None) is not None
     )
     extra_kwargs = {} if not has_vp_stage else {"ignore_virtual": False, "vp_stage": vp_stage}
 
@@ -1088,7 +1146,7 @@ def get_transformer_layer_offset(pipeline_rank, vp_stage, config: TransformerCon
                 offset = vp_stage * total_virtual_chunks + (pipeline_rank * num_layers_per_virtual_rank)
 
                 # Reduce the offset of embedding layer from the total layer number
-                if config.account_for_embedding_in_pipeline_split and not parallel_state.is_pipeline_first_stage(
+                if config.account_for_embedding_in_pipeline_split and not MegatronAdapter.is_pipeline_first_stage(
                     **extra_kwargs
                 ):
                     offset -= 1
@@ -1096,7 +1154,7 @@ def get_transformer_layer_offset(pipeline_rank, vp_stage, config: TransformerCon
                 offset = pipeline_rank * num_layers_per_pipeline_rank
 
                 # Reduce the offset of embedding layer from the total layer number
-                if config.account_for_embedding_in_pipeline_split and not parallel_state.is_pipeline_first_stage(
+                if config.account_for_embedding_in_pipeline_split and not MegatronAdapter.is_pipeline_first_stage(
                     **extra_kwargs
                 ):
                     offset -= 1
@@ -1105,9 +1163,9 @@ def get_transformer_layer_offset(pipeline_rank, vp_stage, config: TransformerCon
     return offset
 
 
-def register_megatron_training_hooks(model: list[torch.nn.Module], optimizer):
-    from megatron.core.distributed import finalize_model_grads
-    from megatron.core.utils import get_model_config
+def register_megatron_training_hooks(model, optimizer):
+    finalize_model_grads = MegatronAdapter.finalize_model_grads
+    get_model_config_func = MegatronAdapter.get_attr_wrapped_model
 
     try:
         from megatron.core.distributed.fsdp.mcore_fsdp_adapter import FullyShardedDataParallel as megatron_FSDP
@@ -1116,7 +1174,7 @@ def register_megatron_training_hooks(model: list[torch.nn.Module], optimizer):
 
     # register some callbacks for megatron training, following https://github.com/NVIDIA/Megatron-LM/blob/core_v0.15.0rc7/megatron/training/training.py#L2039-L2057
     for one_model in model:
-        config = get_model_config(one_model)
+        config = get_model_config_func(one_model, "config", allow_none=False)
         config.grad_scale_func = optimizer.scale_loss
         config.finalize_model_grads_func = finalize_model_grads
 

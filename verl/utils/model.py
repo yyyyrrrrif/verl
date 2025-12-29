@@ -53,7 +53,8 @@ class LambdaLayer(nn.Module):
 
 
 def squeeze(x):
-    return torch.squeeze(x, dim=-1)
+    from verl.utils.megatron_adapter import TorchAdapter
+    return TorchAdapter.squeeze(x, dim=-1)
 
 
 def update_model_config(module_config, override_config_kwargs):
@@ -399,8 +400,7 @@ def _get_parallel_model_architecture_from_config(config: PretrainedConfig, value
 def _load_hf_model(config, model_config, is_value_model):
     """Helper function containing the loading hf model logic"""
     from accelerate import init_empty_weights
-    from megatron.core import parallel_state as mpu
-
+    from verl.utils.megatron_adapter import MegatronAdapter
     from verl.models.mcore.saver import _megatron_calc_global_rank
 
     assert hasattr(model_config, "architectures"), "architectures cannot be empty when load weight!"
@@ -419,9 +419,9 @@ def _load_hf_model(config, model_config, is_value_model):
         local_model_path = config.model.path
         print(f"load from local dir {local_model_path}")
 
-    src_rank = _megatron_calc_global_rank(tp_rank=0, dp_rank=0, pp_rank=0, cp_rank=mpu.get_context_parallel_rank())
-    cpu_init_weights = lambda: torch.device("cpu")
-    init_context = init_empty_weights if torch.distributed.get_rank() != src_rank else cpu_init_weights
+    src_rank = _megatron_calc_global_rank(tp_rank=0, dp_rank=0, pp_rank=0, cp_rank=MegatronAdapter.get_context_parallel_rank())
+    cpu_init_weights = lambda: TorchAdapter.device("cpu")
+    init_context = init_empty_weights if TorchAdapter.distributed_get_rank() != src_rank else cpu_init_weights
     with init_context(), warnings.catch_warnings():
         warnings.simplefilter("ignore")
         # TODO: to find a better way to load mistral7b-rm lm_head
@@ -532,9 +532,8 @@ def pad_packed_inputs(unpad_tokens: torch.Tensor, cu_seqlens, max_seqlen_in_batc
 
 
 def load_mcore_dist_weights(parallel_model, dist_weight_path, is_value_model=False):
-    from megatron.core import dist_checkpointing
     from megatron.core.dist_checkpointing.serialization import StrictHandling
-
+    from verl.utils.megatron_adapter import MegatronAdapter
     from verl.utils.megatron_utils import unwrap_model
 
     # strict = StrictHandling.IGNORE_ALL if is_value_model else StrictHandling.ASSUME_OK_UNEXPECTED
@@ -545,7 +544,7 @@ def load_mcore_dist_weights(parallel_model, dist_weight_path, is_value_model=Fal
             for k in list(ssd.keys()):
                 if "output_layer" in k:
                     ssd.pop(k)
-        dist_checkpointing.load(ssd, dist_weight_path, strict=strict)
+        MegatronAdapter.load_checkpoint(ssd, dist_weight_path, strict=strict)
 
     return
 
@@ -554,7 +553,7 @@ def get_parallel_gptmodel_from_config(
     tfconfig, hf_config, pre_process=None, post_process=None, share_embeddings_and_output_weights=False, value=False
 ):
     from megatron.core.models.gpt.gpt_layer_specs import get_gpt_decoder_block_spec
-    from megatron.core.models.gpt.gpt_model import GPTModel
+    from verl.utils.megatron_adapter import MegatronAdapter, TorchAdapter
 
     use_te = True
     assert tfconfig.normalization == "RMSNorm", "only RMSNorm is supported for now"
@@ -563,7 +562,7 @@ def get_parallel_gptmodel_from_config(
     if hf_config.rope_scaling is not None:
         assert hf_config.rope_scaling["type"] == "linear", "only linear scaling is supported for now"
         rope_scaling_args["seq_len_interpolation_factor"] = hf_config.rope_scaling["factor"]
-    parallel_model = GPTModel(
+    parallel_model = MegatronAdapter.GPTModel(
         config=tfconfig,
         transformer_layer_spec=transformer_layer_spec,
         vocab_size=hf_config.vocab_size,

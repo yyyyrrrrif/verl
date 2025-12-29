@@ -35,13 +35,11 @@ from megatron.core.optimizer import DistributedOptimizer
 from megatron.core.pipeline_parallel import get_forward_backward_func
 from omegaconf import OmegaConf
 from torch import nn
+from verl.utils.megatron_adapter import MegatronAdapter, TorchAdapter
 
 from verl import DataProto
 from verl.trainer.ppo.core_algos import agg_loss, get_policy_loss_fn, kl_penalty
 from verl.utils.device import get_device_id, get_torch_device
-from verl.utils.megatron.pipeline_parallel import make_batch_generator
-from verl.utils.megatron.tensor_parallel import vocab_parallel_entropy, vocab_parallel_log_probs_from_logits
-from verl.utils.megatron_utils import get_model_config
 from verl.utils.profiler import GPUMemoryLogger
 from verl.utils.profiler.profile import Profiler
 from verl.utils.py_functional import append_to_dict
@@ -150,9 +148,9 @@ class MegatronPPOActor(BasePPOActor):
             }
         )
 
-        config = get_model_config(self.actor_module[0])
+        config = MegatronAdapter.get_model_config(self.actor_module[0])
         print(config)
-        config.finalize_model_grads_func = finalize_model_grads
+        config.finalize_model_grads_func = MegatronAdapter.finalize_model_grads
 
     def _validate_config(self, config) -> None:
         """Validate config options not implemented for Megatron backend"""
@@ -205,7 +203,7 @@ class MegatronPPOActor(BasePPOActor):
         # handled by user outside
         recompute_old_log_prob = self.config.get("recompute_old_log_prob", True)
 
-        entropys = torch.Tensor()
+        entropys = TorchAdapter.Tensor()()
         if recompute_old_log_prob:
             select_keys = ["responses", "input_ids", "attention_mask", "position_ids"]
             batch = data.select(batch_keys=select_keys).batch
@@ -213,7 +211,7 @@ class MegatronPPOActor(BasePPOActor):
             batch_size = input_ids.size(0)
             response = batch["responses"]
             response_length = response.size(1)
-            with torch.no_grad():
+            with TorchAdapter.no_grad():
                 output = self.forward_backward_batch(
                     data,
                     forward_only=True,
@@ -223,59 +221,59 @@ class MegatronPPOActor(BasePPOActor):
                     micro_batch_size=micro_batch_size,
                     max_token_len=max_token_len,
                 )
-                if mpu.is_pipeline_last_stage(ignore_virtual=True):
+                if MegatronAdapter.is_pipeline_last_stage(ignore_virtual=True):
                     # only on last rank. It should be on every tp rank
                     if calculate_entropy:
                         log_probs = [o[0]["log_probs"] for o in output["output"]]  # (bs, seq_size)
                     else:
                         log_probs = [o["log_probs"] for o in output["output"]]  # (bs, seq_size)
-                    log_probs = torch.cat(log_probs, dim=0).to(torch.float32)
+                    log_probs = TorchAdapter.cat(log_probs, dim=0).to(TorchAdapter.float32())
                     if use_dynamic_bsz:
                         indices = output["indices"]
                         indices = list(itertools.chain.from_iterable(indices))
                         assert len(indices) == log_probs.size(0), f"{len(indices)} vs. {log_probs.size()}"
-                        revert_indices = torch.tensor(get_reverse_idx(indices), dtype=torch.long)
+                        revert_indices = TorchAdapter.tensor(get_reverse_idx(indices), dtype=TorchAdapter.long())
                         log_probs = log_probs[revert_indices]
                 else:
-                    log_probs = torch.empty(
-                        size=(batch_size, response_length), dtype=torch.float32, device=input_ids.device
+                    log_probs = TorchAdapter.empty(
+                        size=(batch_size, response_length), dtype=TorchAdapter.float32(), device=input_ids.device
                     )
                 log_probs = log_probs.to(get_device_id())
                 # broadcast across pp ranks
-                torch.distributed.broadcast(
+                TorchAdapter.distributed_broadcast(
                     tensor=log_probs,
-                    src=mpu.get_pipeline_model_parallel_last_rank(),
-                    group=mpu.get_pipeline_model_parallel_group(),
+                    src=MegatronAdapter.get_pipeline_model_parallel_last_rank(),
+                    group=MegatronAdapter.get_pipeline_model_parallel_group(),
                     async_op=False,
                 )
                 log_probs = log_probs.to("cpu")
                 if calculate_entropy:
                     # Note that o[0] is metrics, o[1] is entropy
-                    if mpu.is_pipeline_last_stage(ignore_virtual=True):
-                        entropys = torch.cat([o[1] for o in output["output"]], dim=0)
-                        entropys = entropys.to(torch.float32)
+                    if MegatronAdapter.is_pipeline_last_stage(ignore_virtual=True):
+                        entropys = TorchAdapter.cat([o[1] for o in output["output"]], dim=0)
+                        entropys = entropys.to(TorchAdapter.float32())
                         if use_dynamic_bsz:
                             indices = output["indices"]
                             indices = list(itertools.chain.from_iterable(indices))
                             assert len(indices) == entropys.size(0), f"{len(indices)} vs. {entropys.size()}"
-                            revert_indices = torch.tensor(get_reverse_idx(indices), dtype=torch.long)
+                            revert_indices = TorchAdapter.tensor(get_reverse_idx(indices), dtype=TorchAdapter.long())
                             entropys = entropys[revert_indices]
                     else:
-                        entropys = torch.empty(
-                            size=(batch_size, response_length), dtype=torch.float32, device=input_ids.device
+                        entropys = TorchAdapter.empty(
+                            size=(batch_size, response_length), dtype=TorchAdapter.float32(), device=input_ids.device
                         )
                     # broadcast across pp ranks
                     entropys = entropys.to(get_device_id())
-                    torch.distributed.broadcast(
+                    TorchAdapter.distributed_broadcast(
                         tensor=entropys,
-                        src=mpu.get_pipeline_model_parallel_last_rank(),
-                        group=mpu.get_pipeline_model_parallel_group(),
+                        src=MegatronAdapter.get_pipeline_model_parallel_last_rank(),
+                        group=MegatronAdapter.get_pipeline_model_parallel_group(),
                         async_op=False,
                     )
                     entropys = entropys.to("cpu")
 
         # add empty cache after each compute
-        get_torch_device().empty_cache()
+        TorchAdapter.empty_cache()
 
         return log_probs, entropys
 
@@ -358,8 +356,8 @@ class MegatronPPOActor(BasePPOActor):
         mini_batch = data
         broadcast_dict_tensor(
             mini_batch.batch,
-            src=mpu.get_pipeline_model_parallel_last_rank(),
-            group=mpu.get_pipeline_model_parallel_group(),
+            src=MegatronAdapter.get_pipeline_model_parallel_last_rank(),
+            group=MegatronAdapter.get_pipeline_model_parallel_group(),
         )
         mini_batch.to("cpu")
         # split into micro-batches
@@ -367,9 +365,9 @@ class MegatronPPOActor(BasePPOActor):
         self.has_multi_modal_inputs = "multi_modal_inputs" in mini_batch.non_tensor_batch.keys()
         if self.has_multi_modal_inputs:
             mini_batch.batch["multi_modal_inputs"] = mini_batch.non_tensor_batch["multi_modal_inputs"]
-            mini_batch.batch["multi_modal_inputs_idx"] = torch.Tensor(
+            mini_batch.batch["multi_modal_inputs_idx"] = TorchAdapter.Tensor()(
                 list(range(len(mini_batch.non_tensor_batch["multi_modal_inputs"])))
-            ).to(torch.int64)
+            ).to(TorchAdapter.int64())
 
         if mini_batch.batch["position_ids"].dim() == 3:  # qwen2vl mrope [bs, 3, seq_len]
             mini_batch.batch["position_ids"] = mini_batch.batch["position_ids"][
@@ -380,7 +378,7 @@ class MegatronPPOActor(BasePPOActor):
         temperature = data.meta_info["temperature"]
         if use_dynamic_bsz:
             assert max_token_len is not None, "max_token_len must be set when use_dynamic_bsz is True"
-            vpp_size = mpu.get_virtual_pipeline_model_parallel_world_size()
+            vpp_size = MegatronAdapter.get_virtual_pipeline_model_parallel_world_size()
             if vpp_size is not None and vpp_size > 1:
                 microbatch_group_size_per_vp_stage = self.tf_config.microbatch_group_size_per_vp_stage
                 micro_batches, indices = rearrange_micro_batches(
@@ -405,7 +403,7 @@ class MegatronPPOActor(BasePPOActor):
         # compute input shapes for pp stages
         n_micro_batch = len(micro_batches)
 
-        forward_backward_func = get_forward_backward_func()
+        forward_backward_func = MegatronAdapter.get_forward_backward_func()
 
         def loss_func(output, data, meta_info):
             # For memory efficiency
@@ -417,7 +415,8 @@ class MegatronPPOActor(BasePPOActor):
                 if "entropy" in output:
                     entropy = output["entropy"]
             else:
-                assert isinstance(output, torch.Tensor)
+                # TorchAdapter.Tensor() returns the torch.Tensor class
+                assert isinstance(output, TorchAdapter.Tensor())
                 log_probs = output
 
             device = log_probs.device
@@ -430,7 +429,7 @@ class MegatronPPOActor(BasePPOActor):
                     stats = post_process_fn(output, data)
                     metrics.update(stats)
                 if not calculate_entropy:
-                    return torch.tensor(1.0, device=device), metrics
+                    return TorchAdapter.tensor(1.0, device=device), metrics
 
             responses = data["responses"]
             response_length = responses.size(1)
@@ -492,7 +491,7 @@ class MegatronPPOActor(BasePPOActor):
                     ret_entropy = entropy
 
             if forward_only:
-                policy_loss = torch.tensor(1.0, device=device)
+                policy_loss = TorchAdapter.tensor(1.0, device=device)
             else:
                 if self.config.use_kl_loss:
                     ref_log_prob = data["ref_log_prob"]
@@ -522,8 +521,9 @@ class MegatronPPOActor(BasePPOActor):
                 )
                 # TODO: Fix this
                 assert not calculate_entropy, "calculate_entropy must be disabled to return the schedule plan"
-                from megatron.core.models.gpt.gpt_model import GPTModel
 
+                # Note: GPTModel is a class, not an instance, so we check differently
+                from megatron.core.models.gpt.gpt_model import GPTModel
                 assert isinstance(model, GPTModel), "model must be a GPTModel"
                 assert self.use_fused_kernels, "use_fused_kernels must be enabled to return the schedule plan"
                 # TODO: support VLM with MoE
@@ -583,11 +583,11 @@ class MegatronPPOActor(BasePPOActor):
                             "`actor_rollout_ref.model.use_fused_kernels=True`. "
                             "The current `clone()` operation ensures correctness but increases memory usage."
                         )
-                        entropy = vocab_parallel_entropy(logits)
+                        entropy = MegatronAdapter.vocab_parallel_entropy(logits)
                         ret["entropy"] = entropy
                     else:
                         logits_bak = logits
-                    log_probs = vocab_parallel_log_probs_from_logits(logits_bak, label)
+                    log_probs = MegatronAdapter.vocab_parallel_log_probs_from_logits(logits_bak, label)
                     log_probs = log_probs.masked_fill(~label_mask, 0.0)
                     ret["log_probs"] = log_probs
                     return ret
@@ -615,11 +615,11 @@ class MegatronPPOActor(BasePPOActor):
             return output, partial(loss_func, data=batch, meta_info=meta_info)
 
         # batch should be a list of batches inside micro-batches
-        batch_generator = make_batch_generator(micro_batches, vpp_size=len(self.actor_module))
+        batch_generator = MegatronAdapter.make_batch_generator(micro_batches, vpp_size=len(self.actor_module))
 
         # TODO: we may use the new schedule instead
         # for flash-attn: (seq_len, batch_size, hidden_size) = (mbs*seq_len, 1, hidden_size)
-        if mpu.get_pipeline_model_parallel_world_size() > 1:
+        if MegatronAdapter.get_pipeline_model_parallel_world_size() > 1:
             losses_reduced = forward_backward_func(
                 forward_step_func=forward_step,
                 data_iterator=batch_generator,
@@ -672,7 +672,7 @@ class MegatronPPOActor(BasePPOActor):
             # use use_contiguous_buffers_in_local_ddp and no overlap_dp_param_comm
             for chunk in self.actor_module:
                 # if use distributed optimizer, zero grad buffer will be handled by optimizer
-                chunk.zero_grad_buffer()
+                TorchAdapter.zero_grad_buffer(chunk)
 
             calculate_entropy = self.config.entropy_coeff != 0
             if data.meta_info.get("micro_batch_size", None) is not None:
@@ -710,5 +710,5 @@ class MegatronPPOActor(BasePPOActor):
         if self.use_torch_profiler and self.prof and self.prof.enable:
             self.prof.stop_and_save()
             self.prof.stop_trace()
-        get_torch_device().empty_cache()
+        TorchAdapter.empty_cache()
         return metrics
