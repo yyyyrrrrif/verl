@@ -1214,16 +1214,18 @@ class RayPPOTrainer:
             old_log_prob_mfu = 0
         return old_log_prob, old_log_prob_mfu
 
-    def _update_actor(self, batch: DataProto) -> DataProto:
+    def _update_actor(self, batch: DataProto, timing_raw: dict[str, float] = None) -> DataProto:
         rollout_config = self.config.actor_rollout_ref.rollout
         batch.meta_info["multi_turn"] = rollout_config.multi_turn.enable
-        # TODO: Make "temperature" single source of truth from generation.
         batch.meta_info["temperature"] = rollout_config.temperature
+        if timing_raw is None:
+            timing_raw = {}
         # update actor
         if self.use_legacy_worker_impl == "disable":
-            batch_td = batch.to_tensordict()
-            # step 2: convert from padding to no-padding
-            batch_td = left_right_2_no_padding(batch_td)
+            with marked_timer("update_actor/to_tensordict", timing_raw):
+                batch_td = batch.to_tensordict()
+            with marked_timer("update_actor/no_padding", timing_raw):
+                batch_td = left_right_2_no_padding(batch_td)
             calculate_entropy = self.config.actor_rollout_ref.actor.entropy_coeff != 0.0
             distillation_use_topk = (
                 self.distillation_config.distillation_loss.loss_settings.use_topk
@@ -1235,23 +1237,25 @@ class RayPPOTrainer:
             ppo_epochs = self.config.actor_rollout_ref.actor.ppo_epochs
             seed = self.config.actor_rollout_ref.actor.data_loader_seed
             shuffle = self.config.actor_rollout_ref.actor.shuffle
-            tu.assign_non_tensor(
-                batch_td,
-                calculate_entropy=calculate_entropy,
-                distillation_use_topk=distillation_use_topk,
-                global_batch_size=ppo_mini_batch_size,
-                mini_batch_size=ppo_mini_batch_size,
-                epochs=ppo_epochs,
-                seed=seed,
-                dataloader_kwargs={"shuffle": shuffle},
-                compute_loss=True,
-            )
-            actor_output = self.actor_rollout_wg.update_actor(batch_td)
-            actor_output = tu.get(actor_output, "metrics")
-            actor_output = rename_dict(actor_output, "actor/")
-            # modify key name
-            actor_output["perf/mfu/actor"] = actor_output.pop("actor/mfu")
-            actor_output = DataProto.from_single_dict(data={}, meta_info={"metrics": actor_output})
+            with marked_timer("update_actor/assign_meta", timing_raw):
+                tu.assign_non_tensor(
+                    batch_td,
+                    calculate_entropy=calculate_entropy,
+                    distillation_use_topk=distillation_use_topk,
+                    global_batch_size=ppo_mini_batch_size,
+                    mini_batch_size=ppo_mini_batch_size,
+                    epochs=ppo_epochs,
+                    seed=seed,
+                    dataloader_kwargs={"shuffle": shuffle},
+                    compute_loss=True,
+                )
+            with marked_timer("update_actor/rpc_update", timing_raw):
+                actor_output = self.actor_rollout_wg.update_actor(batch_td)
+            with marked_timer("update_actor/postprocess", timing_raw):
+                actor_output = tu.get(actor_output, "metrics")
+                actor_output = rename_dict(actor_output, "actor/")
+                actor_output["perf/mfu/actor"] = actor_output.pop("actor/mfu")
+                actor_output = DataProto.from_single_dict(data={}, meta_info={"metrics": actor_output})
         else:
             actor_output = self.actor_rollout_wg.update_actor(batch)
 
@@ -1571,7 +1575,7 @@ class RayPPOTrainer:
                     else:
                         # update actor
                         with marked_timer("update_actor", timing_raw, color="red"):
-                            actor_output = self._update_actor(batch)
+                            actor_output = self._update_actor(batch, timing_raw=timing_raw)
 
                         # Check if the ESI (Elastic Server Instance)/training plan is close to expiration.
                         esi_close_to_expiration = should_save_ckpt_esi(

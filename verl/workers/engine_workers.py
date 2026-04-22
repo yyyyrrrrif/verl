@@ -273,34 +273,41 @@ class TrainingWorker(Worker, DistProfilerExtension):
 
         with (
             self.engine.train_mode(disable_auto_offload=disable_auto_offload),
-            Timer(name="train_batch", logger=None),
         ):
-            # update
             output_lst = []
             total_num_iterations = data.shape[0] // mini_batch_size_per_gpu * epochs
+            timing_raw = {}
 
             for batch_idx, mini_batch_td in enumerate(dataloader):
-                # add global token num
-                if "input_ids" in mini_batch_td:
-                    global_token_num = mini_batch_td["input_ids"].offsets().diff().tolist()  # (total_nnz,)
-                    # allgather from dp rank
-                    global_token_num_output = [None] * torch.distributed.get_world_size(
-                        self.engine.get_data_parallel_group()
-                    )
-                    torch.distributed.all_gather_object(
-                        global_token_num_output, global_token_num, self.engine.get_data_parallel_group()
-                    )
-                    global_token_num = [x for xs in global_token_num_output for x in xs]
-                else:
-                    global_token_num = None
+                shapes = {k: str(v.shape) for k, v in mini_batch_td.items() if hasattr(v, "shape")}
+                logger.info(f"  mini_batch_td[{batch_idx}]: batch_size={mini_batch_td.shape[0]}, shapes={shapes}")
+                with Timer(name="mini_batch_allgather", logger=None) as t_allgather:
+                    if "input_ids" in mini_batch_td:
+                        global_token_num = mini_batch_td["input_ids"].offsets().diff().tolist()
+                        global_token_num_output = [None] * torch.distributed.get_world_size(
+                            self.engine.get_data_parallel_group()
+                        )
+                        torch.distributed.all_gather_object(
+                            global_token_num_output, global_token_num, self.engine.get_data_parallel_group()
+                        )
+                        global_token_num = [x for xs in global_token_num_output for x in xs]
+                    else:
+                        global_token_num = None
+                timing_raw["mini_batch_allgather"] = timing_raw.get("mini_batch_allgather", 0.0) + t_allgather.last
 
-                tu.assign_non_tensor(
-                    mini_batch_td,
-                    global_token_num=NonTensorData(global_token_num),
-                    update_lr_scheduler=batch_idx == total_num_iterations - 1,
-                    disable_auto_offload=True,
-                )
-                actor_output = self.train_batch(mini_batch_td)
+                with Timer(name="mini_batch_assign_meta", logger=None) as t_assign:
+                    tu.assign_non_tensor(
+                        mini_batch_td,
+                        global_token_num=NonTensorData(global_token_num),
+                        update_lr_scheduler=batch_idx == total_num_iterations - 1,
+                        disable_auto_offload=True,
+                    )
+                timing_raw["mini_batch_assign_meta"] = timing_raw.get("mini_batch_assign_meta", 0.0) + t_assign.last
+
+                with Timer(name="mini_batch_train", logger=None) as t_train:
+                    actor_output = self.train_batch(mini_batch_td)
+                timing_raw["mini_batch_train"] = timing_raw.get("mini_batch_train", 0.0) + t_train.last
+
                 output_lst.append(actor_output)
 
             if self.engine.is_mp_src_rank_with_outputs():
@@ -308,14 +315,18 @@ class TrainingWorker(Worker, DistProfilerExtension):
                 metrics = {}
                 for output in actor_output:
                     for key, val in output.items():
-                        # flattn dp and micro batch
                         if isinstance(val, list):
-                            output[key] = (
-                                Metric.aggregate_dp(val)
-                                if isinstance(val[0], Metric)
-                                else list(chain.from_iterable(val))
-                            )
+                            if isinstance(val[0], Metric):
+                                output[key] = Metric.aggregate_dp(val)
+                            elif isinstance(val[0], list):
+                                output[key] = list(chain.from_iterable(val))
+                            else:
+                                output[key] = val
+                        elif isinstance(val, float):
+                            output[key] = [val]
                     append_to_dict(metrics, output)
+                for name, value in timing_raw.items():
+                    metrics[f"timing_s/{name}"] = value
 
                 output = tu.get_tensordict(tensor_dict={}, non_tensor_dict={"metrics": metrics}).cpu()
             else:
@@ -327,54 +338,60 @@ class TrainingWorker(Worker, DistProfilerExtension):
     def train_batch(self, data: TensorDict) -> TensorDict:
         assert self.loss_fn is not None, "loss function can't be None when calling train_batch"
         assert not self.engine_config.forward_only, "Can't run `train_batch` when forward_only is in the engine config."
-        # global_token_num should be a list of number of tokens of each seq in this batch
         global_token_num = tu.get(data, key="global_token_num")
         disable_auto_offload = tu.get(data, key="disable_auto_offload", default=False)
         images_seqlens = tu.get(data, key="images_seqlens", default=None)
 
-        # inject engineering parameters if not specified
-        default_keys = dict(
-            use_remove_padding=self.model_config.get("use_remove_padding", False),
-            use_dynamic_bsz=self.engine_config.use_dynamic_bsz,
-            max_token_len_per_gpu=self.engine_config.max_token_len_per_gpu,
-            micro_batch_size_per_gpu=self.engine_config.micro_batch_size_per_gpu,
-            use_fused_kernels=self.engine_config.use_fused_kernels,
-        )
-
-        for key, val in default_keys.items():
-            if key not in data.keys():
-                tu.assign_non_tensor(data, **{key: val})
+        with Timer(name="train_batch_inject_params", logger=None) as t_inject:
+            default_keys = dict(
+                use_remove_padding=self.model_config.get("use_remove_padding", False),
+                use_dynamic_bsz=self.engine_config.use_dynamic_bsz,
+                max_token_len_per_gpu=self.engine_config.max_token_len_per_gpu,
+                micro_batch_size_per_gpu=self.engine_config.micro_batch_size_per_gpu,
+                use_fused_kernels=self.engine_config.use_fused_kernels,
+            )
+            for key, val in default_keys.items():
+                if key not in data.keys():
+                    tu.assign_non_tensor(data, **{key: val})
+        inject_params_time = t_inject.last
 
         with (
             self.engine.train_mode(disable_auto_offload=disable_auto_offload),
             Timer(name="train_batch", logger=None) as timer,
         ):
             output = self.engine.train_batch(data, loss_function=self.loss_fn)
-            # containing loss, model_output and metrics
-            # for training, we only care about loss and metrics
         delta_time = timer.last
 
-        update_lr_scheduler = tu.get(data, key="update_lr_scheduler", default=False)
-        # update lr scheduler
-        if update_lr_scheduler:
-            lr = self.engine.lr_scheduler_step()
-        else:
-            lr = None
+        with Timer(name="train_batch_lr_step", logger=None) as t_lr:
+            update_lr_scheduler = tu.get(data, key="update_lr_scheduler", default=False)
+            if update_lr_scheduler:
+                lr = self.engine.lr_scheduler_step()
+            else:
+                lr = None
+        lr_step_time = t_lr.last
+
+        with Timer(name="train_batch_postprocess", logger=None) as t_post:
+            if self.engine.is_mp_src_rank_with_outputs():
+                output.pop("model_output")
+                if lr is not None:
+                    output["metrics"]["lr"] = lr
+                final_output = self._postprocess_output(
+                    output,
+                    global_token_num=global_token_num,
+                    delta_time=delta_time,
+                    forward_only=False,
+                    images_seqlens=images_seqlens,
+                ).cpu()
+            else:
+                final_output = None
+        postprocess_time = t_post.last
 
         if self.engine.is_mp_src_rank_with_outputs():
-            # we don't need model_output in training. Maybe we change out mind later
-            output.pop("model_output")
-            if lr is not None:
-                output["metrics"]["lr"] = lr
-            final_output = self._postprocess_output(
-                output,
-                global_token_num=global_token_num,
-                delta_time=delta_time,
-                forward_only=False,
-                images_seqlens=images_seqlens,
-            ).cpu()
-        else:
-            final_output = None
+            metrics = tu.get(final_output, "metrics")
+            metrics["timing_s/train_batch_inject_params"] = inject_params_time
+            metrics["timing_s/train_batch_engine"] = delta_time
+            metrics["timing_s/train_batch_lr_step"] = lr_step_time
+            metrics["timing_s/train_batch_postprocess"] = postprocess_time
 
         return final_output
 

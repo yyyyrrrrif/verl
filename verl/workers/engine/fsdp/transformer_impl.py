@@ -24,6 +24,7 @@ from typing import Callable, ContextManager, Optional
 
 import torch
 import torch.distributed
+from codetiming import Timer
 from peft import LoraConfig, TaskType, get_peft_model
 from tensordict import TensorDict
 from torch.distributed.fsdp import FullyShardedDataParallel as FSDP
@@ -589,36 +590,60 @@ class FSDPEngine(BaseEngine):
         raise NotImplementedError
 
     def forward_backward_batch(self, data: TensorDict, loss_function: Callable, forward_only=False) -> list[TensorDict]:
-        # note that the global_batch_size should include data on all the dp
         tu.assign_non_tensor(data, sp_size=self.ulysses_sequence_parallel_size)
 
-        # compute num_tokens in global batch for loss normalization
-        batch_num_tokens = data["loss_mask"].sum().to(get_device_id())
-        torch.distributed.all_reduce(
-            batch_num_tokens, op=torch.distributed.ReduceOp.SUM, group=self.get_data_parallel_group()
-        )
-        tu.assign_non_tensor(data, batch_num_tokens=batch_num_tokens.item())
-        tu.assign_non_tensor(data, dp_size=self.get_data_parallel_size())
+        with Timer(name="fwd_bwd_allreduce_tokens", logger=None) as t_allreduce:
+            batch_num_tokens = data["loss_mask"].sum().to(get_device_id())
+            torch.distributed.all_reduce(
+                batch_num_tokens, op=torch.distributed.ReduceOp.SUM, group=self.get_data_parallel_group()
+            )
+            tu.assign_non_tensor(data, batch_num_tokens=batch_num_tokens.item())
+            tu.assign_non_tensor(data, dp_size=self.get_data_parallel_size())
+        allreduce_tokens_time = t_allreduce.last
 
-        micro_batches, indices = prepare_micro_batches(
-            data=data, dp_group=self.get_data_parallel_group(), same_micro_num_in_dp=True
-        )
+        with Timer(name="fwd_bwd_prepare_micro_batches", logger=None) as t_prepare:
+            micro_batches, indices = prepare_micro_batches(
+                data=data, dp_group=self.get_data_parallel_group(), same_micro_num_in_dp=True
+            )
+        prepare_micro_batches_time = t_prepare.last
+
+        logger.info(f"forward_backward_batch: num_micro_batches={len(micro_batches)}")
+        for i, mb in enumerate(micro_batches):
+            shapes = {k: str(v.shape) for k, v in mb.items() if hasattr(v, "shape")}
+            logger.info(f"  micro_batch[{i}]: batch_size={mb.shape[0]}, shapes={shapes}")
 
         output_lst = []
+        fwd_time_acc = 0.0
+        bwd_time_acc = 0.0
 
         ctx = torch.no_grad() if forward_only else nullcontext()
 
         for micro_batch in micro_batches:
             with ctx:
-                loss, meta_info = self.forward_step(micro_batch, loss_function=loss_function, forward_only=forward_only)
+                with Timer(name="fwd_bwd_forward", logger=None) as t_fwd:
+                    loss, meta_info = self.forward_step(micro_batch, loss_function=loss_function, forward_only=forward_only)
+                fwd_time_acc += t_fwd.last
 
                 if not forward_only:
-                    loss.backward()
+                    with Timer(name="fwd_bwd_backward", logger=None) as t_bwd:
+                        loss.backward()
+                    bwd_time_acc += t_bwd.last
 
             output_lst.append(meta_info)
 
-        # postprocess and return
-        return postprocess_batch_func(output_lst=output_lst, indices=indices, data=data)
+        with Timer(name="fwd_bwd_postprocess", logger=None) as t_post:
+            result = postprocess_batch_func(output_lst=output_lst, indices=indices, data=data)
+        postprocess_time = t_post.last
+
+        if "metrics" not in result:
+            result["metrics"] = {}
+        result["metrics"]["timing_s/fwd_bwd_allreduce_tokens"] = allreduce_tokens_time
+        result["metrics"]["timing_s/fwd_bwd_prepare_micro_batches"] = prepare_micro_batches_time
+        result["metrics"]["timing_s/fwd_bwd_forward"] = fwd_time_acc
+        result["metrics"]["timing_s/fwd_bwd_backward"] = bwd_time_acc
+        result["metrics"]["timing_s/fwd_bwd_postprocess"] = postprocess_time
+
+        return result
 
     def forward_step(self, micro_batch: TensorDict, loss_function, forward_only):
         raise NotImplementedError("forward_step must be implemented in subclass")
@@ -1135,28 +1160,42 @@ class FSDPEngineWithLMHead(FSDPEngine):
 
     def forward_step(self, micro_batch: TensorDict, loss_function, forward_only):
         device_name = get_device_name()
-        # actually, we should avoid assigning like this...
         micro_batch = micro_batch.to(get_device_id())
-        model_inputs, output_args = self.prepare_model_inputs(micro_batch=micro_batch)
+
+        with Timer(name="fwd_step_prepare_inputs", logger=None) as t_prep:
+            model_inputs, output_args = self.prepare_model_inputs(micro_batch=micro_batch)
+        prepare_inputs_time = t_prep.last
 
         with torch.autocast(device_type=device_name, dtype=torch.bfloat16):
-            raw_output = self.module(
-                **model_inputs,
-                use_cache=False,
-            )  # prevent model thinks we are generating
+            with Timer(name="fwd_step_model_forward", logger=None) as t_model:
+                raw_output = self.module(
+                    **model_inputs,
+                    use_cache=False,
+                )
+            model_forward_time = t_model.last
 
-            model_output = self.prepare_model_outputs(
-                output=raw_output, output_args=output_args, micro_batch=micro_batch, logits_processor_func=loss_function
-            )
+            with Timer(name="fwd_step_prepare_outputs", logger=None) as t_outputs:
+                model_output = self.prepare_model_outputs(
+                    output=raw_output, output_args=output_args, micro_batch=micro_batch, logits_processor_func=loss_function
+                )
+            prepare_outputs_time = t_outputs.last
 
             if loss_function is not None:
-                loss, metrics = loss_function(
-                    model_output=model_output, data=micro_batch, dp_group=self.get_data_parallel_group()
-                )
+                with Timer(name="fwd_step_loss_compute", logger=None) as t_loss:
+                    loss, metrics = loss_function(
+                        model_output=model_output, data=micro_batch, dp_group=self.get_data_parallel_group()
+                    )
+                loss_compute_time = t_loss.last
             else:
                 assert forward_only, "forward_only must be True when loss_function is None"
                 loss = torch.tensor(1.0, device=device_name)
                 metrics = {}
+                loss_compute_time = 0.0
+
+            metrics["timing_s/fwd_step_prepare_inputs"] = prepare_inputs_time
+            metrics["timing_s/fwd_step_model_forward"] = model_forward_time
+            metrics["timing_s/fwd_step_prepare_outputs"] = prepare_outputs_time
+            metrics["timing_s/fwd_step_loss_compute"] = loss_compute_time
 
             output = {
                 "model_output": model_output,
