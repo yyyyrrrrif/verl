@@ -13,8 +13,10 @@
 # limitations under the License.
 import importlib
 import importlib.util
+import json
 import logging
 import os
+import time
 from typing import Any, Callable, Protocol
 from hydra import compose, initialize_config_dir
 from hydra.core.global_hydra import GlobalHydra
@@ -29,6 +31,59 @@ logger = logging.getLogger(__file__)
 logger.setLevel(os.getenv("VERL_LOGGING_LEVEL", "WARN"))
 
 DEFAULT_ROUTING_CACHE_SIZE = 10000
+
+# ── Routing trace (long-tail experiment) ─────────────────────────────────
+#
+# Writes one JSONL record per acquire / release to a file so the long-tail
+# behaviour of GlobalRequestLoadBalancer (long requests piling onto a few
+# replicas while others sit idle, inflating total rollout time) can be analysed
+# offline. Disabled unless ROUTER_TRACE=1 — the writer then short-circuits to a
+# no-op, so there is zero overhead and no file I/O in production.
+
+_DEFAULT_TRACE_PATH = "./router_trace_global_lb.jsonl"
+
+
+class _RouterTraceWriter:
+    """Append-only JSONL trace writer, env-gated.
+
+    Records are one JSON object per line. Gated by ``ROUTER_TRACE``: when off,
+    ``enabled`` is False and every ``append`` is a no-op fast path, so the
+    load balancer pays nothing. When on, each ``append`` serialises the record
+    and writes + flushes a single line (the LB actor runs acquire/release
+    serially, so no locking is needed for the file handle).
+    """
+
+    _instance: "_RouterTraceWriter | None" = None
+
+    def __init__(self) -> None:
+        self.enabled = os.getenv("ROUTER_TRACE", "") == "1"
+        self.path = os.getenv("ROUTER_TRACE_PATH", _DEFAULT_TRACE_PATH) if self.enabled else None
+
+    @classmethod
+    def get(cls) -> "_RouterTraceWriter":
+        """Return the process-wide writer (lazily created)."""
+        if cls._instance is None:
+            cls._instance = cls()
+        return cls._instance
+
+    def append(self, record: dict) -> None:
+        """Append one trace record as a JSON line. No-op when disabled."""
+        if not self.enabled or self.path is None:
+            return
+        line = json.dumps(record, separators=(",", ":")) + "\n"
+        try:
+            # Open per-append: avoids holding a file handle across the actor's
+            # lifetime and is safe against concurrent actors writing the same
+            # path (each line is a single write() syscall).
+            with open(self.path, "a") as f:
+                f.write(line)
+        except OSError as exc:
+            # Trace is a best-effort experiment harness — never break routing
+            # on a write failure; one warning per failure is enough.
+            logger.warning("[RouterTrace] write failed (%s); record dropped", exc)
+
+
+_trace = _RouterTraceWriter.get()
 
 
 class RequestLoadBalancer(Protocol):
@@ -54,11 +109,16 @@ class RequestLoadBalancer(Protocol):
         """
         ...
 
-    def release_server(self, server_id: str) -> None:
+    def release_server(self, server_id: str, request_id: str | None = None) -> None:
         """Release a server after a request completes.
 
         Args:
             server_id: Identifier of the server to release.
+            request_id: Optional request id of the completing turn. When the
+                load balancer supports per-turn dwell-time tracing it pairs this
+                with the matching ``acquire_server`` to record how long the
+                turn occupied the replica; absent (``None``) it just decrements
+                the in-flight counter. Optional so existing callers keep working.
         """
         ...
 
@@ -120,6 +180,15 @@ class GlobalRequestLoadBalancer:
         self._servers: dict[str, ray.actor.ActorHandle] = dict(servers)
         self._inflight_requests: dict[str, int] = {sid: 0 for sid in servers}
         self._request_id_to_server: LRUCache = LRUCache(maxsize=max_cache_size)
+        # Long-tail trace state (see plan-19). Only touched when tracing is on.
+        # Per-request acquire count (the "turn" — LB's view of which turn of the
+        # conversation this acquire serves, since agent-layer turn counts never
+        # reach the LB).
+        self._request_turn_count: dict[str, int] = {}
+        # request_id → stack of (turn, acquire_ts) for in-flight acquires.
+        # Stack because a request_id can be re-acquired before a prior release
+        # lands (rare, but possible under async); release pops the matching one.
+        self._pending: dict[str, list[tuple[int, float]]] = {}
 
     def acquire_server(self, request_id: str, prompt_ids: list[int] | None = None) -> tuple[str, ray.actor.ActorHandle]:
         """Acquire a server for the given request (sticky + least-loaded).
@@ -127,13 +196,15 @@ class GlobalRequestLoadBalancer:
         Returns:
             A tuple of ``(server_id, actor_handle)`` in a single atomic call.
         """
+        is_sticky = False
         # Try sticky session first
         if request_id in self._request_id_to_server:
             server_id = self._request_id_to_server[request_id]
             # Check if server is still in the active pool
             if server_id in self._inflight_requests:
                 self._inflight_requests[server_id] += 1
-                return server_id, self._servers[server_id]
+                is_sticky = True
+                return self._trace_acquire(request_id, server_id, is_sticky), self._servers[server_id]
             # Server was removed, clear stale cache entry and re-select
             del self._request_id_to_server[request_id]
 
@@ -144,14 +215,69 @@ class GlobalRequestLoadBalancer:
         server_id = min(self._inflight_requests, key=self._inflight_requests.get)
         self._request_id_to_server[request_id] = server_id
         self._inflight_requests[server_id] += 1
-        return server_id, self._servers[server_id]
+        return self._trace_acquire(request_id, server_id, is_sticky), self._servers[server_id]
 
-    def release_server(self, server_id: str) -> None:
-        """Release a server after a request completes."""
-        if server_id not in self._inflight_requests:
+    def release_server(self, server_id: str, request_id: str | None = None) -> None:
+        """Release a server after a request completes.
+
+        When ``request_id`` is supplied it is paired with the matching acquire
+        to emit a dwell-time trace record (how long the turn occupied the
+        replica); otherwise only the in-flight counter is decremented.
+        """
+        inflight_after: int | None = None
+        if server_id in self._inflight_requests:
+            if self._inflight_requests[server_id] > 0:
+                self._inflight_requests[server_id] -= 1
+            inflight_after = self._inflight_requests[server_id]
+        self._trace_release(server_id, request_id, inflight_after)
+
+    # ── Trace helpers (long-tail experiment) ────────────────────────────
+
+    def _trace_acquire(self, request_id: str, server_id: str, is_sticky: bool) -> str:
+        """Record the turn, push (turn, ts) onto the request's pending stack.
+
+        Always returns ``server_id`` so callers can inline it into their return.
+        No-ops to a fast path when tracing is disabled.
+        """
+        turn = self._request_turn_count.get(request_id, 0) + 1
+        self._request_turn_count[request_id] = turn
+        now = time.time()
+        if _trace.enabled:
+            self._pending.setdefault(request_id, []).append((turn, now))
+            _trace.append(
+                {
+                    "event": "acquire",
+                    "ts": now,
+                    "request_id": request_id,
+                    "turn": turn,
+                    "replica_id": server_id,
+                    "is_sticky": is_sticky,
+                    "inflight_after": self._inflight_requests.get(server_id, 0),
+                }
+            )
+        return server_id
+
+    def _trace_release(self, server_id: str, request_id: str | None, inflight_after: int | None) -> None:
+        """Pop the matching acquire and emit a dwell-time release record."""
+        if not _trace.enabled or request_id is None:
             return
-        if self._inflight_requests[server_id] > 0:
-            self._inflight_requests[server_id] -= 1
+        stack = self._pending.get(request_id)
+        if not stack:
+            # Acquire wasn't traced (e.g. it predates tracing-on) — nothing to pair.
+            return
+        turn, acquire_ts = stack.pop()
+        now = time.time()
+        _trace.append(
+            {
+                "event": "release",
+                "ts": now,
+                "request_id": request_id,
+                "turn": turn,
+                "replica_id": server_id,
+                "dwell_sec": round(now - acquire_ts, 6),
+                "inflight_after": inflight_after if inflight_after is not None else 0,
+            }
+        )
 
     def add_servers(self, servers: dict[str, ray.actor.ActorHandle]) -> None:
         """Atomically add multiple servers to the load balancer pool.

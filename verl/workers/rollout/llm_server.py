@@ -68,10 +68,12 @@ class LLMServerClient:
             request_id=request_id, prompt_ids=prompt_ids
         )
 
-    def _release_server(self, server_id: str) -> None:
+    def _release_server(self, server_id: str, request_id: str | None = None) -> None:
         # Fire-and-forget: release is just a counter decrement, no need to await.
         # Awaiting here risks blocking the finally clause if the LB actor is unresponsive.
-        self._load_balancer.release_server.remote(server_id=server_id)
+        # request_id is forwarded so the LB can pair it with the matching acquire to
+        # record per-turn dwell time for the long-tail trace.
+        self._load_balancer.release_server.remote(server_id=server_id, request_id=request_id)
 
     @rollout_trace_op
     async def generate(
@@ -114,7 +116,7 @@ class LLMServerClient:
             )
             return output
         finally:
-            self._release_server(server_id)
+            self._release_server(server_id, request_id=request_id)
 
 
 class LLMServerManager:
