@@ -85,6 +85,18 @@ class _RouterTraceWriter:
 
 _trace = _RouterTraceWriter.get()
 
+# ── Conditional migration knobs (long-tail mitigation) ────────────────────
+#
+# When a sticky-bound replica is heavily overloaded AND a much lighter replica
+# exists, the balancer migrates the request's *future* turns to the lightest
+# replica (paying one prefix-cache recompute to shed the long-tail). Default
+# OFF: overload defaults to +inf so no migration ever happens unless the user
+# sets ROUTER_MIGRATE_OVERLOAD. Calibrate from trace — A-group sticky showed
+# steady inflight 7-10, tail pinned to 16, idle replicas at 3-5, so overload=12
+# + gap=5 keeps migration tail-only.
+_MIGRATE_OVERLOAD = float(os.getenv("ROUTER_MIGRATE_OVERLOAD", "inf"))
+_MIGRATE_GAP = float(os.getenv("ROUTER_MIGRATE_GAP", "1"))
+
 
 class RequestLoadBalancer(Protocol):
     """Protocol for rollout inference load balancers.
@@ -197,14 +209,33 @@ class GlobalRequestLoadBalancer:
             A tuple of ``(server_id, actor_handle)`` in a single atomic call.
         """
         is_sticky = False
+        migrated = False
         # Try sticky session first
         if request_id in self._request_id_to_server:
             server_id = self._request_id_to_server[request_id]
             # Check if server is still in the active pool
             if server_id in self._inflight_requests:
+                # Conditional migration (long-tail mitigation): if the bound
+                # replica is heavily overloaded AND a much lighter replica
+                # exists, migrate this request's future turns to the lightest
+                # replica — paying one prefix-cache recompute to shed the
+                # long-tail. Tail-only by construction: steady-state replicas
+                # are half-loaded so the gap condition fails.
+                target = self._pick_migration_target(server_id)
+                if target is not None:
+                    # Migrate: rebind sticky to the lightest replica so the
+                    # following turns stay there (preserve its prefix cache).
+                    self._request_id_to_server[request_id] = target
+                    self._inflight_requests[target] += 1
+                    migrated = True
+                    return (
+                        self._trace_acquire(request_id, target, is_sticky=False, migrated=True),
+                        self._servers[target],
+                    )
+                # Not migrated: keep sticky on the bound replica.
                 self._inflight_requests[server_id] += 1
                 is_sticky = True
-                return self._trace_acquire(request_id, server_id, is_sticky), self._servers[server_id]
+                return self._trace_acquire(request_id, server_id, is_sticky, migrated=False), self._servers[server_id]
             # Server was removed, clear stale cache entry and re-select
             del self._request_id_to_server[request_id]
 
@@ -215,7 +246,39 @@ class GlobalRequestLoadBalancer:
         server_id = min(self._inflight_requests, key=self._inflight_requests.get)
         self._request_id_to_server[request_id] = server_id
         self._inflight_requests[server_id] += 1
-        return self._trace_acquire(request_id, server_id, is_sticky), self._servers[server_id]
+        return self._trace_acquire(request_id, server_id, is_sticky, migrated=False), self._servers[server_id]
+
+    def _pick_migration_target(self, bound_server_id: str) -> str | None:
+        """Return a lighter replica to migrate to, or ``None`` to stay sticky.
+
+        Migration fires only when BOTH hold (conditional, tail-only by
+        construction):
+          1. the bound replica is heavily overloaded — its in-flight count is
+             at least ``_MIGRATE_OVERLOAD``;
+          2. a sufficiently lighter replica exists — the gap between the bound
+             replica's in-flight and the lightest other replica's is at least
+             ``_MIGRATE_GAP``.
+
+        When both hold, returns the globally lightest other replica (so the
+        migrated turn lands where there's most headroom). Otherwise ``None`` —
+        the caller keeps the sticky binding.
+
+        The judgment uses only in-flight counts today; ported to the
+        KVCAwareBalancer it swaps in a ``kv_usage + running + waiting`` load
+        metric for a more accurate signal.
+        """
+        if _MIGRATE_OVERLOAD == float("inf"):
+            return None  # migration disabled (default)
+        bound_inflight = self._inflight_requests.get(bound_server_id, 0)
+        if bound_inflight < _MIGRATE_OVERLOAD:
+            return None  # condition 1: bound not heavily overloaded
+        candidates = {sid: c for sid, c in self._inflight_requests.items() if sid != bound_server_id}
+        if not candidates:
+            return None
+        lightest_id = min(candidates, key=candidates.get)
+        if bound_inflight - candidates[lightest_id] < _MIGRATE_GAP:
+            return None  # condition 2: no sufficiently lighter replica
+        return lightest_id
 
     def release_server(self, server_id: str, request_id: str | None = None) -> None:
         """Release a server after a request completes.
@@ -233,7 +296,7 @@ class GlobalRequestLoadBalancer:
 
     # ── Trace helpers (long-tail experiment) ────────────────────────────
 
-    def _trace_acquire(self, request_id: str, server_id: str, is_sticky: bool) -> str:
+    def _trace_acquire(self, request_id: str, server_id: str, is_sticky: bool, migrated: bool = False) -> str:
         """Record the turn, push (turn, ts) onto the request's pending stack.
 
         Always returns ``server_id`` so callers can inline it into their return.
@@ -252,6 +315,7 @@ class GlobalRequestLoadBalancer:
                     "turn": turn,
                     "replica_id": server_id,
                     "is_sticky": is_sticky,
+                    "migrated": migrated,
                     "inflight_after": self._inflight_requests.get(server_id, 0),
                 }
             )
