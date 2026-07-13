@@ -87,15 +87,30 @@ _trace = _RouterTraceWriter.get()
 
 # ── Conditional migration knobs (long-tail mitigation) ────────────────────
 #
-# When a sticky-bound replica is heavily overloaded AND a much lighter replica
-# exists, the balancer migrates the request's *future* turns to the lightest
-# replica (paying one prefix-cache recompute to shed the long-tail). Default
-# OFF: overload defaults to +inf so no migration ever happens unless the user
-# sets ROUTER_MIGRATE_OVERLOAD. Calibrate from trace — A-group sticky showed
-# steady inflight 7-10, tail pinned to 16, idle replicas at 3-5, so overload=12
-# + gap=5 keeps migration tail-only.
-_MIGRATE_OVERLOAD = float(os.getenv("ROUTER_MIGRATE_OVERLOAD", "inf"))
-_MIGRATE_GAP = float(os.getenv("ROUTER_MIGRATE_GAP", "1"))
+# When a sticky-bound replica is a *straggler* AND idle replicas exist to
+# absorb the load, the balancer migrates the request's *future* turns to the
+# lightest replica (paying one prefix-cache recompute to shed the long-tail).
+#
+# The judgment is RELATIVE, not an absolute inflight threshold. Trace analysis
+# (A-group sticky) showed the tail forms at inflight 6-9 on the straggler while
+# the rest have drained to 0 — an absolute overload threshold (e.g. 12) can
+# never fire there because the tail's absolute level sits below the steady-state
+# peak, so it only triggered during warm-up (8/6818 acquires, none in the tail).
+# The features that actually separate "tail" from "steady overload":
+#   * bound inflight relative to the fleet mean  (straggler, ranked at front)
+#   * number of near-idle replicas               (headroom exists → it's a tail)
+# Raw inflight variance does NOT separate them (steady≈tail); the idle count /
+# normalised variance (CV) does.
+#
+# Default OFF: OVER_FACTOR defaults to +inf so no migration ever happens unless
+# the user sets ROUTER_MIGRATE_OVER_FACTOR. Calibrated starting point from the
+# A-group trace: OVER_FACTOR=1.5, MIN_IDLE=2, IDLE_THRESH=1, GAP=4, MIN_ABS=3
+# (fires across mid+tail, 0× in warm-up).
+_MIGRATE_OVER_FACTOR = float(os.getenv("ROUTER_MIGRATE_OVER_FACTOR", "inf"))
+_MIGRATE_MIN_IDLE = int(os.getenv("ROUTER_MIGRATE_MIN_IDLE", "2"))
+_MIGRATE_IDLE_THRESH = int(os.getenv("ROUTER_MIGRATE_IDLE_THRESH", "1"))
+_MIGRATE_GAP = float(os.getenv("ROUTER_MIGRATE_GAP", "4"))
+_MIGRATE_MIN_ABS = int(os.getenv("ROUTER_MIGRATE_MIN_ABS", "3"))
 
 
 class RequestLoadBalancer(Protocol):
@@ -216,11 +231,12 @@ class GlobalRequestLoadBalancer:
             # Check if server is still in the active pool
             if server_id in self._inflight_requests:
                 # Conditional migration (long-tail mitigation): if the bound
-                # replica is heavily overloaded AND a much lighter replica
-                # exists, migrate this request's future turns to the lightest
-                # replica — paying one prefix-cache recompute to shed the
-                # long-tail. Tail-only by construction: steady-state replicas
-                # are half-loaded so the gap condition fails.
+                # replica is a straggler relative to the fleet AND near-idle
+                # replicas exist to absorb it, migrate this request's future
+                # turns to the lightest replica — paying one prefix-cache
+                # recompute to shed the long-tail. Relative + headroom-gated by
+                # construction: in steady state every replica is busy so the
+                # idle-count condition fails and sticky is preserved.
                 target = self._pick_migration_target(server_id)
                 if target is not None:
                     # Migrate: rebind sticky to the lightest replica so the
@@ -251,33 +267,55 @@ class GlobalRequestLoadBalancer:
     def _pick_migration_target(self, bound_server_id: str) -> str | None:
         """Return a lighter replica to migrate to, or ``None`` to stay sticky.
 
-        Migration fires only when BOTH hold (conditional, tail-only by
-        construction):
-          1. the bound replica is heavily overloaded — its in-flight count is
-             at least ``_MIGRATE_OVERLOAD``;
-          2. a sufficiently lighter replica exists — the gap between the bound
-             replica's in-flight and the lightest other replica's is at least
-             ``_MIGRATE_GAP``.
+        Long-tail is a *relative* phenomenon: in the tail a straggler replica
+        sits at inflight 6-9 while the rest have drained to 0. An absolute
+        overload threshold can't see this (the tail's absolute level is well
+        below the steady-state peak), so the judgment is relative to the current
+        fleet. Migration fires only when ALL hold:
 
-        When both hold, returns the globally lightest other replica (so the
+          (A) the bound replica is a straggler — its inflight is at least
+              ``_MIGRATE_OVER_FACTOR`` times the fleet mean (ranked at the
+              front);
+          (B) real headroom exists — at least ``_MIGRATE_MIN_IDLE`` replicas are
+              near-idle (inflight <= ``_MIGRATE_IDLE_THRESH``). This is what
+              separates the tail (some replicas drained) from steady-state
+              overload (all replicas busy), where migrating would only thrash
+              prefix cache;
+          (C) the lightest replica is at least ``_MIGRATE_GAP`` lighter than the
+              bound one;
+          (D) floor — bound inflight is at least ``_MIGRATE_MIN_ABS``, so the
+              final two or three requests aren't churned (migration costs a
+              prefix recompute a near-drained fleet can't repay).
+
+        When all hold, returns the globally lightest other replica (so the
         migrated turn lands where there's most headroom). Otherwise ``None`` —
         the caller keeps the sticky binding.
 
-        The judgment uses only in-flight counts today; ported to the
-        KVCAwareBalancer it swaps in a ``kv_usage + running + waiting`` load
-        metric for a more accurate signal.
+        Note: ``bound_inflight`` here is the count *before* this turn's acquire
+        is added (the increment happens in the caller), i.e. the replica's
+        currently-running turns.
+
+        Ported to the KVCAwareBalancer, (A)/(B)/(C) swap the inflight count for a
+        ``kv_usage + running + waiting`` load metric; the structure is unchanged.
         """
-        if _MIGRATE_OVERLOAD == float("inf"):
+        if _MIGRATE_OVER_FACTOR == float("inf"):
             return None  # migration disabled (default)
-        bound_inflight = self._inflight_requests.get(bound_server_id, 0)
-        if bound_inflight < _MIGRATE_OVERLOAD:
-            return None  # condition 1: bound not heavily overloaded
-        candidates = {sid: c for sid, c in self._inflight_requests.items() if sid != bound_server_id}
-        if not candidates:
-            return None
+        counts = self._inflight_requests
+        if len(counts) < 2:
+            return None  # nowhere to migrate to
+        bound_inflight = counts.get(bound_server_id, 0)
+        if bound_inflight < _MIGRATE_MIN_ABS:
+            return None  # (D) floor: too few inflight to be worth churning
+        mean = sum(counts.values()) / len(counts)
+        if bound_inflight < _MIGRATE_OVER_FACTOR * mean:
+            return None  # (A) bound is not a straggler relative to the fleet
+        n_idle = sum(1 for c in counts.values() if c <= _MIGRATE_IDLE_THRESH)
+        if n_idle < _MIGRATE_MIN_IDLE:
+            return None  # (B) no headroom → steady overload, not a tail
+        candidates = {sid: c for sid, c in counts.items() if sid != bound_server_id}
         lightest_id = min(candidates, key=candidates.get)
         if bound_inflight - candidates[lightest_id] < _MIGRATE_GAP:
-            return None  # condition 2: no sufficiently lighter replica
+            return None  # (C) no sufficiently lighter replica
         return lightest_id
 
     def release_server(self, server_id: str, request_id: str | None = None) -> None:
