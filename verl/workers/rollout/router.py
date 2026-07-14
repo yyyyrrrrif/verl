@@ -427,6 +427,198 @@ class GlobalRequestLoadBalancer:
         }
 
 
+# ── Experiment-only forced-migration load balancer (plan-21) ────────────────
+#
+# A research instrument, NOT a production strategy. With 2 replicas + 2
+# requests it forces request #2 to migrate from replica r0 to r1 at turn N
+# (env ROUTER_FORCE_MIGRATE_TURN), so the end-to-end cost of "migrate the 2nd
+# request at turn N" can be measured across N ∈ {1,2,5,10,20,50} vs a no-migrate
+# baseline. The judgment is forced (no overload detection) — the goal is to map
+# the migration payoff curve, not to make a routing decision.
+#
+# Setup assumptions (see plan-21): --num-workers 2, 2 replicas (tp=1),
+# --max-num-seqs 1 (so the two requests serialise on r0 in the baseline rather
+# than batch-parallel — migration then saves real queue time).
+
+_FORCE_MIGRATE_TURN_ENV = os.getenv("ROUTER_FORCE_MIGRATE_TURN", "")
+
+
+@ray.remote
+class ExperimentForceMigrateBalancer:
+    """Force request #2 to migrate to r1 at turn N (env-gated, research-only).
+
+    Behaviour:
+      - replicas sorted by id; r0 = first, r1 = second.
+      - request #1 (first acquire): sticky to r0 throughout.
+      - request #2 (second acquire): sticky to r0 for turns < N, then at
+        turn >= N rebind to r1 and stay there (preserve r1 prefix cache).
+      - other requests (shouldn't occur in the 2-sample experiment): least-inflight.
+      - ROUTER_FORCE_MIGRATE_TURN unset → request #2 stays on r0 (baseline).
+    """
+
+    def __init__(self, servers: dict[str, ray.actor.ActorHandle], max_cache_size: int = DEFAULT_ROUTING_CACHE_SIZE):
+        if not servers:
+            raise ValueError("servers must be non-empty")
+        self._servers: dict[str, ray.actor.ActorHandle] = dict(servers)
+        self._inflight_requests: dict[str, int] = {sid: 0 for sid in servers}
+        self._request_id_to_server: LRUCache = LRUCache(maxsize=max_cache_size)
+        # sorted replica ids; r0 = primary, r1 = migration target.
+        self._sorted_ids: list[str] = sorted(self._inflight_requests.keys())
+        # request_id → arrival order (1-based). First acquire of a request gets
+        # the next order number, so request #2 is identifiable as order==2.
+        self._arrival_order: dict[str, int] = {}
+        self._next_arrival = 1
+        # request_id → turn count (LB's view, mirrors GlobalRequestLoadBalancer).
+        self._request_turn_count: dict[str, int] = {}
+        # request_id → stack of (turn, ts) for in-flight acquires (trace dwell pairing)
+        self._pending: dict[str, list[tuple[int, float]]] = {}
+        # env: empty string = baseline (no forced migration). N must be a positive int.
+        # Read live at construction (not module load) so a process can flip the
+        # knob between runs without re-importing.
+        env_val = os.getenv("ROUTER_FORCE_MIGRATE_TURN", "")
+        self._force_turn: int | None = None
+        if env_val:
+            try:
+                self._force_turn = int(env_val)
+                if self._force_turn < 1:
+                    raise ValueError
+            except ValueError:
+                logger.warning(
+                    "ExperimentForceMigrateBalancer: ROUTER_FORCE_MIGRATE_TURN='%s' "
+                    "not a positive int; falling back to no-migrate baseline",
+                    env_val,
+                )
+                self._force_turn = None
+
+    def acquire_server(self, request_id: str, prompt_ids: list[int] | None = None) -> tuple[str, ray.actor.ActorHandle]:
+        """Acquire — request #2 migrates to r1 at turn >= N; else sticky."""
+        turn = self._request_turn_count.get(request_id, 0) + 1
+        self._request_turn_count[request_id] = turn
+        # assign arrival order on first sight of this request
+        if request_id not in self._arrival_order:
+            self._arrival_order[request_id] = self._next_arrival
+            self._next_arrival += 1
+        arrival = self._arrival_order[request_id]
+
+        migrated = False
+        r0 = self._sorted_ids[0]
+        r1 = self._sorted_ids[1] if len(self._sorted_ids) > 1 else r0
+
+        if request_id in self._request_id_to_server:
+            bound = self._request_id_to_server[request_id]
+            if bound in self._inflight_requests:
+                # Forced migration: request #2 reaches turn N → rebind to r1.
+                # Only fires when env set, request is #2, at/after turn N, and
+                # not already on r1 (idempotent across later turns).
+                if (
+                    arrival == 2
+                    and self._force_turn is not None
+                    and turn >= self._force_turn
+                    and bound != r1
+                    and r1 != r0  # need a distinct target replica
+                ):
+                    self._request_id_to_server[request_id] = r1
+                    self._inflight_requests[r1] += 1
+                    migrated = True
+                    return self._trace_acquire(request_id, r1, is_sticky=False, migrated=True, turn=turn), self._servers[r1]
+                # otherwise keep sticky on the bound replica.
+                self._inflight_requests[bound] += 1
+                return self._trace_acquire(request_id, bound, is_sticky=True, migrated=False, turn=turn), self._servers[bound]
+            # bound replica removed → clear and re-select
+            del self._request_id_to_server[request_id]
+
+        # New request: both #1 and #2 start on r0 (request #2 migrates only at turn>=N).
+        # Other arrivals (>2, shouldn't happen in the experiment) use least-inflight.
+        if arrival <= 2:
+            target = r0
+        else:
+            if not self._inflight_requests:
+                raise RuntimeError("No available servers in load balancer")
+            target = min(self._inflight_requests, key=self._inflight_requests.get)
+        self._request_id_to_server[request_id] = target
+        self._inflight_requests[target] += 1
+        return self._trace_acquire(request_id, target, is_sticky=False, migrated=False, turn=turn), self._servers[target]
+
+    def release_server(self, server_id: str, request_id: str | None = None) -> None:
+        """Release — decrement inflight; pair with acquire for dwell trace."""
+        inflight_after: int | None = None
+        if server_id in self._inflight_requests:
+            if self._inflight_requests[server_id] > 0:
+                self._inflight_requests[server_id] -= 1
+            inflight_after = self._inflight_requests[server_id]
+        self._trace_release(server_id, request_id, inflight_after)
+
+    # ── trace helpers (shared format with GlobalRequestLoadBalancer) ─────
+
+    def _trace_acquire(self, request_id: str, server_id: str, *, is_sticky: bool, migrated: bool, turn: int) -> str:
+        now = time.time()
+        if _trace.enabled:
+            self._pending.setdefault(request_id, []).append((turn, now))
+            _trace.append(
+                {
+                    "event": "acquire",
+                    "ts": now,
+                    "request_id": request_id,
+                    "turn": turn,
+                    "arrival": self._arrival_order.get(request_id, -1),
+                    "replica_id": server_id,
+                    "is_sticky": is_sticky,
+                    "migrated": migrated,
+                    "inflight_after": self._inflight_requests.get(server_id, 0),
+                }
+            )
+        return server_id
+
+    def _trace_release(self, server_id: str, request_id: str | None, inflight_after: int | None) -> None:
+        if not _trace.enabled or request_id is None:
+            return
+        stack = self._pending.get(request_id)
+        if not stack:
+            return
+        turn, acquire_ts = stack.pop()
+        now = time.time()
+        _trace.append(
+            {
+                "event": "release",
+                "ts": now,
+                "request_id": request_id,
+                "turn": turn,
+                "arrival": self._arrival_order.get(request_id, -1),
+                "replica_id": server_id,
+                "dwell_sec": round(now - acquire_ts, 6),
+                "inflight_after": inflight_after if inflight_after is not None else 0,
+            }
+        )
+
+    # ── Protocol passthrough (add/remove/get-all/get-status) ─────────────
+
+    def add_servers(self, servers: dict[str, ray.actor.ActorHandle]) -> None:
+        for sid, handle in servers.items():
+            self._inflight_requests[sid] = 0
+            self._servers[sid] = handle
+        self._sorted_ids = sorted(self._inflight_requests.keys())
+        logger.info(f"[ExperimentForceMigrate] added {len(servers)} servers")
+
+    def remove_servers(self, server_ids: list[str]) -> None:
+        for sid in server_ids:
+            self._inflight_requests.pop(sid, None)
+            self._servers.pop(sid, None)
+        self._sorted_ids = sorted(self._inflight_requests.keys())
+        logger.info(f"[ExperimentForceMigrate] removed {len(server_ids)} servers")
+
+    def get_all_servers(self) -> list[str]:
+        return list(self._inflight_requests.keys())
+
+    def get_status(self) -> dict:
+        return {
+            "servers": dict(self._inflight_requests),
+            "total_inflight": sum(self._inflight_requests.values()),
+            "active_servers": len(self._inflight_requests),
+            "force_turn": self._force_turn,
+            "sorted_ids": self._sorted_ids,
+        }
+
+
 class LoadBalancerRegistry:
     """Registry for load-balancer strategy factory functions.
 
@@ -607,6 +799,24 @@ def _create_plugin_extension(
 
 LoadBalancerRegistry.register("global_sticky_inflight", _create_global_sticky_inflight)
 LoadBalancerRegistry.register("plugin_extension", _create_plugin_extension)
+
+
+def _create_experiment_force_migrate(
+    servers: dict[str, Any],
+    router_config: RouterConfig | None = None,
+):
+    """Factory for the experiment-only forced-migration balancer (plan-21).
+
+    Reads ROUTER_FORCE_MIGRATE_TURN at construction. No router_config needed;
+    the env is the single knob. Research instrument — not for production.
+    """
+    return ExperimentForceMigrateBalancer.remote(
+        servers=servers,
+        max_cache_size=DEFAULT_ROUTING_CACHE_SIZE,
+    )
+
+
+LoadBalancerRegistry.register("experiment_force_migrate", _create_experiment_force_migrate)
 
 
 def get_router_handle(servers: dict[str, Any], router_config: RouterConfig = None) -> Any:
