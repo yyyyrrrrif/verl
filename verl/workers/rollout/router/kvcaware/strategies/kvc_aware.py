@@ -385,6 +385,10 @@ class KVCacheAwareStrategy:
             )
 
         thresh = cap * (1.0 - self.load_threshold)
+        # Selection key: max remaining (most free after assign) is the primary
+        # axis — ``need`` only breaks remaining-ties, picking the replica with
+        # fewer prefill tokens (better prefix hit).
+        pick = lambda i: (rows[i]["remaining"], -rows[i]["need"])
         cold_start = cap <= 0 or all(row["kv_perc"] <= 1e-6 for row in rows)
         if cold_start:
             top = min(range(n), key=lambda i: rows[i]["inflight_tokens"])
@@ -392,10 +396,11 @@ class KVCacheAwareStrategy:
         else:
             eligible = [i for i in range(n) if rows[i]["avail"] >= thresh]
             if not eligible:
-                top = max(range(n), key=lambda i: rows[i]["remaining"])
-                logger.info("score(): CAPACITY_TOKEN_AWARE no eligible → max remaining")
+                top = max(range(n), key=pick)
+                logger.info("score(): CAPACITY_TOKEN_AWARE no eligible → max remaining (min need tiebreak)")
             else:
-                top = max(eligible, key=lambda i: rows[i]["remaining"])
+                top = max(eligible, key=pick)
+                logger.info("score(): CAPACITY_TOKEN_AWARE → max remaining (min need tiebreak) within eligible")
 
         for i, row in enumerate(rows):
             tag = " ← WINNER" if i == top else ""
