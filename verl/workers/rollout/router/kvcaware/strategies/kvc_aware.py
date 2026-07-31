@@ -254,7 +254,7 @@ class KVCacheAwareStrategy:
         if self.slow_cut == SlowCut.PREFIX_LOAD_AWARE:
             return self._prefix_load_aware(store, replicas, prompt_ids or [])
         if self.slow_cut == SlowCut.CAPACITY_TOKEN_AWARE:
-            return self._capacity_token_scores(store, replicas, prompt_ids or [])
+            return self._capacity_token_scores(store, replicas, request_id, prompt_ids or [])
         raise ValueError(f"Unknow slowcut type {self.slow_cut}")
 
     def _prefix_load_aware(
@@ -343,6 +343,7 @@ class KVCacheAwareStrategy:
         self,
         store: DataStore,
         replicas: list[ReplicaInfo],
+        request_id: str | None,
         prompt_ids: list[int],
     ) -> list[float]:
         """Capacity-gated token routing (discrete: winner=STICKY_TOP_SCORE, rest 0).
@@ -389,7 +390,7 @@ class KVCacheAwareStrategy:
         # axis — ``need`` only breaks remaining-ties, picking the replica with
         # fewer prefill tokens (better prefix hit).
         pick = lambda i: (rows[i]["remaining"], -rows[i]["need"])
-        cold_start = cap <= 0 or all(row["kv_perc"] <= 1e-6 for row in rows)
+        cold_start = store.get_sticky_binding(request_id) is None
         if cold_start:
             top = min(range(n), key=lambda i: rows[i]["inflight_tokens"])
             logger.info("score(): CAPACITY_TOKEN_AWARE cold start → min inflight_tokens")
