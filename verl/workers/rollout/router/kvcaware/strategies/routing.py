@@ -113,7 +113,18 @@ def route(
         for idx in range(n):
             final[idx] += weight * scores[idx]
 
+    # Rank best-first. Among replicas tied at the top score, pick one at random
+    # (instead of the stable sort's always-first bias) so a true cold start or
+    # a same-prompt rollout wave spreads across the pool rather than collapsing
+    # onto pool[0]. Lower ranks keep their stable order — only the winner set
+    # is randomized.
     ranking = sorted(range(n), key=lambda idx: _rank_key(final[idx]), reverse=True)
+    top_score = _rank_key(final[ranking[0]])
+    top_ties = [idx for idx in ranking if _rank_key(final[idx]) == top_score]
+    if len(top_ties) > 1:
+        chosen = random.choice(top_ties)
+        # Move the random pick to the head; keep the rest in stable order.
+        ranking = [chosen] + [idx for idx in ranking if idx != chosen]
     scores_str = ", ".join(f"{replicas[idx].replica_id}={final[idx]:.4f}" for idx in ranking)
     logger.info(f"route(): replicas={n} ranking=[{scores_str}]")
     return [replicas[idx].replica_id for idx in ranking]
