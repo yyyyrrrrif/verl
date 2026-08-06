@@ -35,14 +35,5 @@ class OverloadMode(str, Enum):
     KV_CACHE_USAGE_PERC = "kv_cache_usage_perc"
     # _compute_load(kv, running, waiting, inflight) > load_threshold
     KV_LOAD = "kv_load"
-    # num_requests_waiting > 0 — vLLM is queueing requests on this replica, a
-    # direct result-level evidence of KV-capacity overload (the request did not
-    # fit in the running set and was deferred to the waiting queue). Unlike the
-    # occupancy signals above, this is binary (no load_threshold) and its
-    # trigger rate adapts to the context: loose capacity (8192) almost never
-    # queues → locality dominates; tight capacity (32768) queues often →
-    # fallback to load balancing dominates. 5s polled, but single-direction
-    # safe (overload discovered late, never a false "full" on an empty replica).
-    WAITING = "waiting"
     # do not do overload
     NONE = "None"

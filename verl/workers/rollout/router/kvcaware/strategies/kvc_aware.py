@@ -191,17 +191,8 @@ class KVCacheAwareStrategy:
             # plot can show the overload-check load alongside the combined-score load.
             logger.info(f"is-overload replica={replica.replica_id} kv_load={load:.4f}")
             return load > self.load_threshold
-        if self.overload_mode == OverloadMode.WAITING:
-            # Result-level overload evidence: vLLM deferred a request to its
-            # waiting queue, which only happens when the KV cache cannot fit
-            # another running request. Binary (no load_threshold); trigger rate
-            # adapts to context — see OverloadMode.WAITING docstring.
-            waiting = store.get_metric(replica.replica_id, MetricKey.NUM_REQUESTS_WAITING) or 0
-            logger.info(f"is-overload replica={replica.replica_id} waiting={waiting}")
-            return waiting > 0
         raise ValueError(
-            f"There is no {self.overload_mode}, please set overload_mode in "
-            f"['None', 'kv_cache_usage_perc', 'kv_load', 'waiting']"
+            f"There is no {self.overload_mode}, please set overload_mode in ['None', 'kv_cache_usage_perc', 'kv_load']"
         )
 
     def _sticky_shortcut(
@@ -242,12 +233,17 @@ class KVCacheAwareStrategy:
         store: DataStore,
         replicas: list[ReplicaInfo],
         request_id: str | None = None,
+        gpu_hash_strs: list[str] | None = None,
     ) -> list[float]:
         """Score each replica. Larger is better.
 
         After the sticky short-circuit misses, the ``slow_cut`` mode selects the
         fallback scoring: ``prefix-load-aware`` → ``S = α·S_cache + (1-α)·S_load``;
         ``least-inflight`` → ``-INFLIGHT_COUNT`` (verl GlobalRequestLoadBalancer-style).
+
+        ``gpu_hash_strs`` is the caller-computed prefix-hash chain (shared
+        across replicas, computed once in ``route()``). When ``None``, resolve
+        here — backward-compat for direct callers that don't pre-resolve.
         """
         if not isinstance(replicas, list):
             raise StrategyError(f"replicas must be a list, got {type(replicas).__name__}")
@@ -262,7 +258,10 @@ class KVCacheAwareStrategy:
         if self.slow_cut == SlowCut.LEAST_INFLIGHT:
             return [-store.get_metric(r.replica_id, MetricKey.INFLIGHT_COUNT) for r in replicas]
         # Hash-resolving slow_cuts share one resolution across all replicas.
-        gpu_hash_strs = resolve_prefix_hashes(prompt_ids or [], request_id, store)
+        # Prefer the caller-supplied resolution (computed once in route());
+        # fall back to resolving here for direct callers.
+        if gpu_hash_strs is None:
+            gpu_hash_strs = resolve_prefix_hashes(prompt_ids or [], request_id, store)
         if self.slow_cut == SlowCut.PREFIX_LOAD_AWARE:
             return self._prefix_load_aware(store, replicas, gpu_hash_strs)
         if self.slow_cut == SlowCut.CAPACITY_TOKEN_AWARE:
@@ -363,31 +362,45 @@ class KVCacheAwareStrategy:
 
         For each replica ``i``::
 
-            avail[i]     = cap × (1 - kv_cache_usage_perc[i])   # free tokens (no cache)
-            need[i]      = len(prompt_ids) × (1 - gpu_hit[i])    # prefill this req adds
-            remaining[i] = avail[i] - need[i]                    # free tokens after assign
+            need[i]      = len(prompt_ids) × (1 - gpu_hit[i])     # prefill this req adds
+            remaining[i] = avail[i] - need[i] - inflight_tokens[i]  # free after assign
             eligible[i]  = avail[i] >= cap × (1 - load_threshold)   # pure capacity gate
 
-        One unified ranking (no cold-start special-casing): replicas above the
-        capacity gate rank before those below, each group ordered by
-        ``remaining`` descending. Every replica tied at the top ``remaining``
-        gets ``STICKY_TOP_SCORE`` (not just one) — ``route()`` then breaks the
-        tie at random, so a true cold start (all metrics 0 → all tied) no
-        longer collapses onto ``pool[0]`` and same-prompt rollouts spread
-        evenly across replicas instead of always hitting the first.
+        ``avail[i]`` has two regimes, switched per-replica by whether vLLM
+        /metrics has polled it yet (``KV_CACHE_USAGE_PERC`` key present in the
+        store dict — the value-default 0.0 can't distinguish "un-polled" from
+        "polled-zero", so we check key presence):
+
+            cold start (un-polled):  avail = cap - inflight_tokens
+                ``kv_cache_usage_perc`` lags ~5s (vLLM /metrics polling); before
+                the first poll lands it reads 0, which would over-report ``avail``
+                as full capacity during the startup surge. ``inflight_tokens``
+                (router-side, immediate) double-counts shared prefixes once
+                concurrency ramps, but in the few-second blind window it is still
+                small and the bias is bounded.
+            steady state (polled):   avail = cap × (1 - kv_perc)
+                ``kv_perc`` is vLLM's dedup'd occupancy (incl. generation +
+                retained), precise but lagged; once it arrives it takes over.
+
+        Per-replica switch — whichever replica gets polled first switches
+        first. Ranking: replicas above the capacity gate rank before those
+        below, each group ordered by ``remaining`` descending. Replicas tied
+        at the top ``remaining`` all get ``STICKY_TOP_SCORE`` — ``route()``
+        breaks the tie at random (anti pool[0]-collapse).
         """
         n = len(replicas)
         cap = self._total_token_capacity(store)
         plen = len(prompt_ids) if prompt_ids else 0
         rows: list[dict] = []
         for replica in replicas:
-            kv_perc = store.get_metric(replica.replica_id, MetricKey.KV_CACHE_USAGE_PERC) or 0.0
+            kv_perc = store.get_metric(replica.replica_id, MetricKey.KV_CACHE_USAGE_PERC) or 0
             inflight = store.get_metric(replica.replica_id, MetricKey.INFLIGHT_COUNT) or 0
             inflight_tokens = store.get_metric(replica.replica_id, MetricKey.INFLIGHT_TOKENS) or 0
             s_cache, gpu_hit = self._cache_score(store, replica, gpu_hash_strs)
+
             avail = cap * (1.0 - kv_perc)
             need = plen * (1.0 - gpu_hit)
-            remaining = avail - need - inflight_tokens
+            remaining = avail - need
             rows.append(
                 {
                     "replica": replica,
@@ -426,7 +439,7 @@ class KVCacheAwareStrategy:
                 f"gpu_hit={row['gpu_hit']:.3f} inflight={row['inflight']} "
                 f"avail={row['avail']:.0f} need={row['need']:.0f} "
                 f"max_num_batched_tokens={self._max_num_batched_tokens} inflight_tokens={row['inflight_tokens']:} "
-                f"remaining={row['remaining']:.0f}{tag}"
+                f"remaining={row['remaining']:.0f} {tag}"
             )
         winners = [rows[i]["replica"].replica_id for i in top_idx]
         logger.info(
